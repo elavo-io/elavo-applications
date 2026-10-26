@@ -17,6 +17,12 @@ install -Dm755 target/release/elavo-applications-helper \
 install -Dm755 nautilus/libelavo-applications.so \
     "${dest}/usr/lib64/nautilus/extensions-4/libelavo-applications.so"
 
+# The core crate names this path, so it does not follow PREFIX.
+for image in template.png mask.png; do
+    install -Dm644 "_resources/standardized-icons/${image}" \
+        "${dest}/usr/share/elavo-applications/standardized-icons/${image}"
+done
+
 install -Dm644 "data/${id}.desktop" "${dest}${prefix}/share/applications/${id}.desktop"
 install -Dm644 "data/${id}.dbus.service" "${dest}${prefix}/share/dbus-1/services/${id}.service"
 install -Dm644 "data/${id}.policy" "${dest}${prefix}/share/polkit-1/actions/${id}.policy"

@@ -21,13 +21,14 @@ use crate::prompt::{Prompt, Style};
 const APP_ID: &str = "io.elavo.Applications";
 /// Files the service writes inside a bundle. Anything else that appears
 /// there is a picture dropped onto the entry.
-const OWN_FILES: [&str; 6] = [
+const OWN_FILES: [&str; 7] = [
     "entry.json",
     "launch.desktop",
     "original.desktop",
     "run",
     "icon.png",
     "icon.svg",
+    icon::STANDARD,
 ];
 
 pub fn run() -> glib::ExitCode {
@@ -238,7 +239,7 @@ impl Service {
             };
             let Some(target) = target else { return };
             let name = display_name(&target);
-            if name.ends_with("~") || OWN_FILES.contains(&name.as_str()) {
+            if name.ends_with("~") || name.starts_with('.') || OWN_FILES.contains(&name.as_str()) {
                 return;
             }
             let bundle_path = bundle_path.clone();

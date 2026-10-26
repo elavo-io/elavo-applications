@@ -9,3 +9,4 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+gdk-pixbuf.workspace = true
