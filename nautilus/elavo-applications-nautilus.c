@@ -8,8 +8,12 @@
  * - Move to Trash and Delete refuse an entry whose application is running.
  *   The view's actions are replaced by wrappers that check first and then
  *   call Nautilus's own action. Emission hooks cannot stop a signal.
- * - A drag that starts on an entry offers only a link, so dropping it in
- *   another folder or on the Dock never moves the install.
+ * - A drag that starts on an entry never moves or copies the install.
+ *   Wayland has no link action, so the drag offers a copy. Dropped in a
+ *   Files window, on a folder, a sidebar place, or the path bar, the entry
+ *   is swapped for a shortcut file and Nautilus copies that; inside an
+ *   Applications folder the drop does nothing. The Dock pins it and the
+ *   desktop makes its own shortcut.
  * - Item labels leave out the .eapp suffix.
  * - A drop into a shared folder this account cannot write asks for an
  *   administrator's password (elavo-applications-ctl install --shared).
@@ -21,12 +25,14 @@
 
 #include <dlfcn.h>
 #include <gio/gdesktopappinfo.h>
+#include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SUFFIX ".eapp"
@@ -46,6 +52,8 @@ static FileInfoGetLocation file_info_get_location;
 static GType slot_type;
 static GType files_view_type;
 static GType view_cell_type;
+static GType sidebar_type;
+static GType path_bar_type;
 
 /* ---- Paths ---- */
 
@@ -544,22 +552,146 @@ installable(const char *path)
            g_str_has_suffix(path, ".flatpakref") || g_str_has_suffix(path, ".flatpak");
 }
 
+/* The folder a drop lands in, where that is known: the folder item it was
+ * dropped on, or the folder the view shows. NULL for the sidebar and the
+ * path bar. */
+static char *
+drop_folder(GtkWidget *widget)
+{
+    if (view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) {
+        char *path = cell_path(widget);
+        if (path && g_file_test(path, G_FILE_TEST_IS_DIR))
+            return path;
+        g_free(path);
+    }
+    return slot_path(ancestor(widget, slot_type));
+}
+
+/* Inside ~/Applications or the shared folder, or one of them. */
 static gboolean
-on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer data)
+in_applications(const char *resolved)
+{
+    char *home = g_build_filename(g_get_home_dir(), "Applications", NULL);
+    char *dirs[] = { real(home), shared_dir() };
+    gboolean inside = FALSE;
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS(dirs); i++) {
+        gsize n = dirs[i] ? strlen(dirs[i]) : 0;
+        if (n && strncmp(resolved, dirs[i], n) == 0 && (resolved[n] == '\0' || resolved[n] == '/'))
+            inside = TRUE;
+        g_free(dirs[i]);
+    }
+    g_free(home);
+    return inside;
+}
+
+/* A shortcut file for `bundle`, written in a folder of its own under the
+ * runtime directory for Nautilus to copy. Folders from earlier drops are
+ * removed once they are an hour old. */
+static GFile *
+shortcut_for(const char *bundle)
+{
+    char *root = g_build_filename(g_get_user_runtime_dir(), "elavo-applications", "shortcuts", NULL);
+    char *dir;
+    char *out = NULL;
+    GFile *result = NULL;
+    GDir *old;
+    const char *name;
+
+    g_mkdir_with_parents(root, 0700);
+    if ((old = g_dir_open(root, 0, NULL))) {
+        while ((name = g_dir_read_name(old))) {
+            char *path = g_build_filename(root, name, NULL);
+            struct stat st;
+            if (stat(path, &st) == 0 && time(NULL) - st.st_mtime > 3600) {
+                GDir *inner = g_dir_open(path, 0, NULL);
+                const char *file;
+                while (inner && (file = g_dir_read_name(inner))) {
+                    char *child = g_build_filename(path, file, NULL);
+                    g_unlink(child);
+                    g_free(child);
+                }
+                if (inner)
+                    g_dir_close(inner);
+                g_rmdir(path);
+            }
+            g_free(path);
+        }
+        g_dir_close(old);
+    }
+    dir = g_build_filename(root, "XXXXXX", NULL);
+    if (g_mkdtemp(dir)) {
+        const char *argv[] = { ctl(), "shortcut", bundle, dir, NULL };
+        int status = 0;
+        if (g_spawn_sync(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL,
+                         &out, NULL, &status, NULL) &&
+            g_spawn_check_wait_status(status, NULL) && out) {
+            g_strstrip(out);
+            if (*out)
+                result = g_file_new_for_path(out);
+        }
+    }
+    g_free(out);
+    g_free(dir);
+    g_free(root);
+    return result;
+}
+
+/* Decides a drop before Nautilus does. TRUE ends it. Otherwise, when
+ * `replacement` was filled in, Nautilus gets that file list instead. */
+static gboolean
+on_drop(GtkDropTarget *target, const GValue *value, GValue *replacement)
 {
     GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(target));
-    char *folder = slot_path(ancestor(widget, slot_type));
+    char *folder = drop_folder(widget);
     char *resolved = real(folder);
     char *shared = shared_dir();
     gboolean handled = FALSE;
-    GSList *files, *l;
+    gboolean bundles = FALSE;
+    GSList *files, *l, *swapped = NULL;
 
-    (void)x;
-    (void)y;
-    (void)data;
-    if (resolved && g_strcmp0(resolved, shared) == 0 && access(resolved, W_OK) != 0 &&
-        G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST)) {
-        files = gdk_file_list_get_files(g_value_get_boxed(value));
+    if (!G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST))
+        goto out;
+    files = gdk_file_list_get_files(g_value_get_boxed(value));
+
+    /* An entry dragged out of Applications becomes a shortcut wherever it
+     * lands, and nothing at all inside an Applications folder. The drag
+     * offers a copy, the one action Wayland has that suits, so Nautilus is
+     * handed the shortcut to copy instead of the install. */
+    for (l = files; l; l = l->next) {
+        char *path = g_file_get_path(l->data);
+        char *bundle = real(path);
+        if (bundle && is_bundle(bundle)) {
+            GFile *shortcut = NULL;
+            bundles = TRUE;
+            if (!(resolved && in_applications(resolved)))
+                shortcut = shortcut_for(bundle);
+            if (shortcut)
+                swapped = g_slist_prepend(swapped, shortcut);
+        } else {
+            swapped = g_slist_prepend(swapped, g_object_ref(l->data));
+        }
+        g_free(bundle);
+        g_free(path);
+    }
+    if (bundles) {
+        swapped = g_slist_reverse(swapped);
+        if (swapped) {
+            g_value_init(replacement, GDK_TYPE_FILE_LIST);
+            g_value_take_boxed(replacement, gdk_file_list_new_from_list(swapped));
+        } else {
+            handled = TRUE;
+        }
+        g_slist_free_full(swapped, g_object_unref);
+        g_slist_free(files);
+        goto out;
+    }
+    g_slist_free_full(swapped, g_object_unref);
+
+    /* Returning TRUE ends the drop before Nautilus tries the copy itself and
+     * reports that the folder is read-only. */
+    if (resolved && g_strcmp0(resolved, shared) == 0 && access(resolved, W_OK) != 0) {
         for (l = files; l; l = l->next) {
             char *path = g_file_get_path(l->data);
             if (path && installable(path)) {
@@ -569,13 +701,12 @@ on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer
             }
             g_free(path);
         }
-        g_slist_free(files);
     }
+    g_slist_free(files);
+out:
     g_free(shared);
     g_free(resolved);
     g_free(folder);
-    /* Returning TRUE ends the drop before Nautilus tries the copy itself and
-     * reports that the folder is read-only. */
     return handled;
 }
 
@@ -586,22 +717,26 @@ static gboolean
 on_drop_first(GtkDropTarget *target, const GValue *value, double x, double y, gpointer data)
 {
     GArray *blocked = g_object_get_data(G_OBJECT(target), BLOCKED);
+    GValue replacement = G_VALUE_INIT;
     gboolean result = FALSE;
     guint i;
 
+    (void)data;
     if (g_object_get_data(G_OBJECT(target), PASSING))
         return FALSE;
-    if (on_drop(target, value, x, y, data))
+    if (on_drop(target, value, &replacement))
         return TRUE;
-    if (!blocked || blocked->len == 0)
-        return FALSE;
-    for (i = 0; i < blocked->len; i++)
-        g_signal_handler_unblock(target, g_array_index(blocked, gulong, i));
-    g_object_set_data(G_OBJECT(target), PASSING, GINT_TO_POINTER(1));
-    g_signal_emit_by_name(target, "drop", value, x, y, &result);
-    g_object_set_data(G_OBJECT(target), PASSING, NULL);
-    for (i = 0; i < blocked->len; i++)
-        g_signal_handler_block(target, g_array_index(blocked, gulong, i));
+    if (blocked && blocked->len > 0) {
+        for (i = 0; i < blocked->len; i++)
+            g_signal_handler_unblock(target, g_array_index(blocked, gulong, i));
+        g_object_set_data(G_OBJECT(target), PASSING, GINT_TO_POINTER(1));
+        g_signal_emit_by_name(target, "drop", G_IS_VALUE(&replacement) ? &replacement : value, x, y, &result);
+        g_object_set_data(G_OBJECT(target), PASSING, NULL);
+        for (i = 0; i < blocked->len; i++)
+            g_signal_handler_block(target, g_array_index(blocked, gulong, i));
+    }
+    if (G_IS_VALUE(&replacement))
+        g_value_unset(&replacement);
     return result;
 }
 
@@ -657,7 +792,7 @@ on_prepare_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpoi
     if (resolved && is_bundle(resolved)) {
         dragging = g_object_ref(source);
         saved_actions = gtk_drag_source_get_actions(source);
-        gtk_drag_source_set_actions(source, GDK_ACTION_LINK);
+        gtk_drag_source_set_actions(source, GDK_ACTION_COPY);
     }
     g_free(resolved);
     g_free(path);
@@ -695,6 +830,10 @@ on_map_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpointer
         files_view_type = g_type_from_name("NautilusFilesView");
     if (!view_cell_type)
         view_cell_type = g_type_from_name("NautilusViewCell");
+    if (!sidebar_type)
+        sidebar_type = g_type_from_name("NautilusSidebar");
+    if (!path_bar_type)
+        path_bar_type = g_type_from_name("NautilusPathBar");
 
     if (slot_type && g_type_check_instance_is_a((GTypeInstance *)widget, slot_type))
         watch_slot(widget);
@@ -703,6 +842,9 @@ on_map_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpointer
     else if ((GTK_IS_LABEL(widget) || GTK_IS_INSCRIPTION(widget)) && ancestor(widget, view_cell_type))
         watch_label(widget);
     else if ((GTK_IS_GRID_VIEW(widget) || GTK_IS_COLUMN_VIEW(widget)) && ancestor(widget, files_view_type))
+        watch_drop_targets(widget);
+    else if ((view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) ||
+             ancestor(widget, sidebar_type) || ancestor(widget, path_bar_type))
         watch_drop_targets(widget);
     return TRUE;
 }
@@ -752,7 +894,9 @@ G_MODULE_EXPORT void
 nautilus_module_initialize(GTypeModule *module)
 {
     (void)module;
-    start();
+    /* A preloaded copy under test replaces the installed one. */
+    if (!g_getenv("ELAVO_APPLICATIONS_PRELOAD"))
+        start();
 }
 
 G_MODULE_EXPORT void
