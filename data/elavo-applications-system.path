@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch the shared Applications folder and the system Flatpaks
+
+[Path]
+PathChanged=/var/Applications
+PathChanged=/var/lib/flatpak/app
+Unit=elavo-applications-system.service
+
+[Install]
+WantedBy=paths.target

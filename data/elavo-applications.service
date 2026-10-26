@@ -1,0 +1,20 @@
+[Unit]
+Description=Elavo Applications folder
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP=elavo
+
+[Service]
+# Installs what this account drops into ~/Applications or /Applications,
+# keeps ~/Applications in step with the account's Flatpaks, and asks
+# Uninstall or Keep when an entry reaches the Trash.
+Type=dbus
+BusName=io.elavo.Applications
+ExecStart=/usr/bin/elavo-applications
+Restart=on-failure
+RestartSec=1
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

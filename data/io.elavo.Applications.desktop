@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Applications
+Comment=Installs what is dropped into the Applications folder
+Exec=/usr/bin/elavo-applications
+Icon=folder-applications
+NoDisplay=true
+DBusActivatable=true

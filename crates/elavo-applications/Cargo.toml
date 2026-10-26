@@ -1,0 +1,12 @@
+[package]
+name = "elavo-applications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+elavo-applications-core.workspace = true
+gtk.workspace = true
+libc.workspace = true
+async-channel = "2"

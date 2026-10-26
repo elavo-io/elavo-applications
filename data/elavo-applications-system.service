@@ -1,0 +1,17 @@
+[Unit]
+Description=Elavo shared Applications folder
+After=local-fs.target systemd-tmpfiles-setup.service
+ConditionPathIsDirectory=/var/Applications
+
+[Service]
+# One pass: locked entries for the image's system applications, an entry
+# for every system Flatpak, installs of files root owns (copied in by
+# elavo-applications-helper), and the shared desktop-file exports. The path
+# unit starts it again when the folder or the system Flatpaks change.
+Type=oneshot
+ExecStart=/usr/bin/elavo-applications --system
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Build in the toolbox and run a program from this repository on the host.
+# Usage: scripts/dev-run elavo-applications|elavo-applications-ctl [args...]
+#
+# Before the image ships the shared folder, point the service at a test one:
+#   ELAVO_SHARED_APPLICATIONS=/tmp/shared-apps scripts/dev-run elavo-applications
+set -eu
+
+cd "$(dirname "$0")/.."
+bin="${1:?usage: scripts/dev-run elavo-applications|elavo-applications-ctl [args...]}"
+shift
+toolbox_name="${ELAVO_TOOLBOX:-elavo-dev}"
+
+case "${bin}" in
+    elavo-applications) package=elavo-applications ;;
+    elavo-applications-ctl | elavo-applications-helper) package=elavo-applications-ctl ;;
+    *) echo "dev-run: unknown program ${bin}" >&2; exit 2 ;;
+esac
+
+toolbox run -c "${toolbox_name}" cargo build -p "${package}"
+
+# The service is a single instance; a running copy would swallow the new one.
+if [ "${bin}" = elavo-applications ]; then
+    systemctl --user stop elavo-applications.service 2>/dev/null || true
+    if pkill -x elavo-applicati 2>/dev/null; then
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            pgrep -x elavo-applicati >/dev/null || break
+            sleep 0.3
+        done
+    fi
+fi
+
+exec "target/debug/${bin}" "$@"

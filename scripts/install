@@ -1,0 +1,31 @@
+#!/bin/sh
+# Install a release build. Run `cargo build --release` and
+# `make -C nautilus` first. Honors DESTDIR and PREFIX (default /usr). The
+# image build calls this.
+set -eu
+
+cd "$(dirname "$0")/.."
+prefix="${PREFIX:-/usr}"
+dest="${DESTDIR:-}"
+id=io.elavo.Applications
+
+install -Dm755 target/release/elavo-applications "${dest}${prefix}/bin/elavo-applications"
+install -Dm755 target/release/elavo-applications-ctl "${dest}${prefix}/bin/elavo-applications-ctl"
+# The polkit policy and the ctl name this path, so it does not follow PREFIX.
+install -Dm755 target/release/elavo-applications-helper \
+    "${dest}/usr/libexec/elavo-applications-helper"
+install -Dm755 nautilus/libelavo-applications.so \
+    "${dest}/usr/lib64/nautilus/extensions-4/libelavo-applications.so"
+
+install -Dm644 "data/${id}.desktop" "${dest}${prefix}/share/applications/${id}.desktop"
+install -Dm644 "data/${id}.dbus.service" "${dest}${prefix}/share/dbus-1/services/${id}.service"
+install -Dm644 "data/${id}.policy" "${dest}${prefix}/share/polkit-1/actions/${id}.policy"
+# Units, tmpfiles, and the environment name fixed paths; the image enables
+# the units.
+install -Dm644 data/elavo-applications.service "${dest}/usr/lib/systemd/user/elavo-applications.service"
+for unit in elavo-applications-system.service elavo-applications-system.path; do
+    install -Dm644 "data/${unit}" "${dest}/usr/lib/systemd/system/${unit}"
+done
+install -Dm644 data/elavo-applications.tmpfiles.conf "${dest}/usr/lib/tmpfiles.d/elavo-applications.conf"
+install -Dm644 data/60-elavo-applications.conf "${dest}/usr/lib/environment.d/60-elavo-applications.conf"
+install -Dm644 data/elavo-applications.sh "${dest}/etc/profile.d/elavo-applications.sh"

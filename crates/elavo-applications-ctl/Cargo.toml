@@ -1,0 +1,20 @@
+[package]
+name = "elavo-applications-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+elavo-applications-core.workspace = true
+gio.workspace = true
+gio-unix.workspace = true
+libc.workspace = true
+
+[[bin]]
+name = "elavo-applications-ctl"
+path = "src/main.rs"
+
+[[bin]]
+name = "elavo-applications-helper"
+path = "src/helper.rs"
