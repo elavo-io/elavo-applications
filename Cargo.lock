@@ -80,6 +80,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "elavo-applications-core",
+ "gio-unix",
  "gtk4",
  "libc",
 ]

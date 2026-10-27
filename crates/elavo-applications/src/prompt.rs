@@ -1,4 +1,4 @@
-//! The one window the service shows: a question or a notice, one at a time,
+//! The service's question window: a question or a notice, one at a time,
 //! queued. It is made once and hidden between uses. GTK 4.22.5 destroys a
 //! window's icon buffers twice when the window is finalized, which takes the
 //! process down, so this window is never destroyed.
@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use gtk::prelude::*;
+use gtk::{gdk, glib};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Style {
@@ -16,20 +17,65 @@ pub enum Style {
     Destructive,
 }
 
+/// Buttons in a row at the end, or stacked full width under the message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Row,
+    Stacked,
+}
+
+pub struct Choice {
+    label: String,
+    /// The label while Alt is held, for a button that does something else
+    /// then.
+    alt_label: Option<String>,
+    style: Style,
+}
+
+impl Choice {
+    pub fn new(label: &str, style: Style) -> Self {
+        Choice {
+            label: label.to_owned(),
+            alt_label: None,
+            style,
+        }
+    }
+
+    pub fn alt(mut self, label: &str) -> Self {
+        self.alt_label = Some(label.to_owned());
+        self
+    }
+}
+
+/// The button pressed, whether Alt was held, and whether the check box was
+/// ticked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub index: usize,
+    pub alt: bool,
+    pub checked: bool,
+}
+
 struct Ask {
     title: String,
     body: String,
-    buttons: Vec<(String, Style)>,
-    reply: async_channel::Sender<Option<usize>>,
+    layout: Layout,
+    choices: Vec<Choice>,
+    check: Option<String>,
+    reply: async_channel::Sender<Option<Answer>>,
 }
 
 pub struct Prompt {
     window: gtk::Window,
     title: gtk::Label,
     body: gtk::Label,
+    check: gtk::CheckButton,
     buttons: gtk::Box,
+    /// The shown buttons with their two labels.
+    shown: RefCell<Vec<(gtk::Button, String, Option<String>)>>,
+    alt: Cell<bool>,
     queue: RefCell<VecDeque<Ask>>,
-    current: RefCell<Option<async_channel::Sender<Option<usize>>>>,
+    current: RefCell<Option<async_channel::Sender<Option<Answer>>>>,
     showing_notice: Cell<bool>,
 }
 
@@ -56,11 +102,8 @@ impl Prompt {
             .wrap(true)
             .max_width_chars(52)
             .build();
-        let buttons = gtk::Box::builder()
-            .spacing(8)
-            .halign(gtk::Align::End)
-            .margin_top(10)
-            .build();
+        let check = gtk::CheckButton::builder().margin_top(4).build();
+        let buttons = gtk::Box::builder().spacing(8).margin_top(10).build();
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -71,13 +114,17 @@ impl Prompt {
             .build();
         content.append(&title);
         content.append(&body);
+        content.append(&check);
         content.append(&buttons);
         window.set_child(Some(&content));
         let prompt = Rc::new(Prompt {
             window,
             title,
             body,
+            check,
             buttons,
+            shown: RefCell::default(),
+            alt: Cell::new(false),
             queue: RefCell::default(),
             current: RefCell::default(),
             showing_notice: Cell::new(false),
@@ -87,7 +134,46 @@ impl Prompt {
             if let Some(p) = weak.upgrade() {
                 p.answer(None);
             }
-            gtk::glib::Propagation::Proceed
+            glib::Propagation::Proceed
+        });
+
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&prompt);
+        keys.connect_modifiers(move |_, state| {
+            if let Some(p) = weak.upgrade() {
+                p.set_alt(state.contains(gdk::ModifierType::ALT_MASK));
+            }
+            glib::Propagation::Proceed
+        });
+        let weak = Rc::downgrade(&prompt);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let Some(p) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            match key {
+                gdk::Key::Escape => {
+                    p.answer(None);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Alt_L | gdk::Key::Alt_R => {
+                    p.set_alt(true);
+                    glib::Propagation::Proceed
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        let weak = Rc::downgrade(&prompt);
+        keys.connect_key_released(move |_, key, _, _| {
+            if let (Some(p), gdk::Key::Alt_L | gdk::Key::Alt_R) = (weak.upgrade(), key) {
+                p.set_alt(false);
+            }
+        });
+        prompt.window.add_controller(keys);
+        let weak = Rc::downgrade(&prompt);
+        prompt.window.connect_is_active_notify(move |w| {
+            if let (Some(p), false) = (weak.upgrade(), w.is_active()) {
+                p.set_alt(false);
+            }
         });
         prompt
     }
@@ -100,11 +186,51 @@ impl Prompt {
         body: &str,
         buttons: &[(&str, Style)],
     ) -> Option<usize> {
+        let choices = buttons.iter().map(|(l, s)| Choice::new(l, *s)).collect();
+        self.choose(title, body, Layout::Row, choices)
+            .await
+            .map(|a| a.index)
+    }
+
+    /// [`ask`](Self::ask) with a layout and labels that change with Alt.
+    pub async fn choose(
+        self: &Rc<Self>,
+        title: &str,
+        body: &str,
+        layout: Layout,
+        choices: Vec<Choice>,
+    ) -> Option<Answer> {
+        self.enqueue(title, body, layout, choices, None).await
+    }
+
+    /// [`ask`](Self::ask) with an unticked check box above the buttons.
+    pub async fn ask_with_check(
+        self: &Rc<Self>,
+        title: &str,
+        body: &str,
+        buttons: &[(&str, Style)],
+        check: &str,
+    ) -> Option<Answer> {
+        let choices = buttons.iter().map(|(l, s)| Choice::new(l, *s)).collect();
+        self.enqueue(title, body, Layout::Row, choices, Some(check.to_owned()))
+            .await
+    }
+
+    async fn enqueue(
+        self: &Rc<Self>,
+        title: &str,
+        body: &str,
+        layout: Layout,
+        choices: Vec<Choice>,
+        check: Option<String>,
+    ) -> Option<Answer> {
         let (tx, rx) = async_channel::bounded(1);
         self.queue.borrow_mut().push_back(Ask {
             title: title.to_owned(),
             body: body.to_owned(),
-            buttons: buttons.iter().map(|(l, s)| ((*l).to_owned(), *s)).collect(),
+            layout,
+            choices,
+            check,
             reply: tx,
         });
         let idle = self.current.borrow().is_none();
@@ -123,9 +249,20 @@ impl Prompt {
     pub fn tell(self: &Rc<Self>, title: &str, body: &str) {
         let this = self.clone();
         let (title, body) = (title.to_owned(), body.to_owned());
-        gtk::glib::spawn_future_local(async move {
+        glib::spawn_future_local(async move {
             this.ask(&title, &body, &[("OK", Style::Suggested)]).await;
         });
+    }
+
+    fn set_alt(&self, alt: bool) {
+        if self.alt.replace(alt) == alt {
+            return;
+        }
+        for (button, label, alt_label) in self.shown.borrow().iter() {
+            if let Some(alt_label) = alt_label {
+                button.set_label(if alt { alt_label } else { label });
+            }
+        }
     }
 
     fn next(self: &Rc<Self>) {
@@ -136,13 +273,37 @@ impl Prompt {
         self.title.set_label(&ask.title);
         self.body.set_label(&ask.body);
         self.body.set_visible(!ask.body.is_empty());
+        self.check.set_active(false);
+        self.check.set_label(ask.check.as_deref());
+        self.check.set_visible(ask.check.is_some());
         while let Some(child) = self.buttons.first_child() {
             self.buttons.remove(&child);
         }
+        let stacked = ask.layout == Layout::Stacked;
+        self.buttons.set_orientation(if stacked {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        });
+        self.buttons.set_halign(if stacked {
+            gtk::Align::Fill
+        } else {
+            gtk::Align::End
+        });
+        let held = gdk::Display::default()
+            .and_then(|d| d.default_seat())
+            .and_then(|s| s.keyboard())
+            .is_some_and(|k| k.modifier_state().contains(gdk::ModifierType::ALT_MASK));
+        self.alt.set(held);
         self.window.set_default_widget(None::<&gtk::Widget>);
-        for (i, (label, style)) in ask.buttons.iter().enumerate() {
+        let mut shown = Vec::new();
+        for (i, choice) in ask.choices.iter().enumerate() {
+            let label = match (&choice.alt_label, held) {
+                (Some(alt), true) => alt,
+                _ => &choice.label,
+            };
             let button = gtk::Button::with_label(label);
-            match style {
+            match choice.style {
                 Style::Suggested => button.add_css_class("suggested-action"),
                 Style::Destructive => button.add_css_class("destructive-action"),
                 Style::Plain => {}
@@ -150,21 +311,29 @@ impl Prompt {
             let weak = Rc::downgrade(self);
             button.connect_clicked(move |_| {
                 if let Some(p) = weak.upgrade() {
-                    p.answer(Some(i));
+                    let alt = p.alt.get();
+                    let checked = p.check.is_visible() && p.check.is_active();
+                    p.answer(Some(Answer {
+                        index: i,
+                        alt,
+                        checked,
+                    }));
                 }
             });
             self.buttons.append(&button);
-            if *style == Style::Suggested {
+            if choice.style == Style::Suggested {
                 self.window.set_default_widget(Some(&button));
             }
+            shown.push((button, choice.label.clone(), choice.alt_label.clone()));
         }
+        self.shown.replace(shown);
         self.showing_notice
-            .set(ask.buttons.len() == 1 && ask.buttons[0].1 == Style::Suggested);
+            .set(ask.choices.len() == 1 && ask.choices[0].style == Style::Suggested);
         self.current.replace(Some(ask.reply));
         self.window.present();
     }
 
-    fn answer(self: &Rc<Self>, choice: Option<usize>) {
+    fn answer(self: &Rc<Self>, choice: Option<Answer>) {
         let Some(reply) = self.current.take() else {
             return;
         };

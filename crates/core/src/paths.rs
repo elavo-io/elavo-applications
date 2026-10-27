@@ -56,6 +56,14 @@ pub fn shared_exports() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/lib/elavo-applications/exports/share/applications"))
 }
 
+pub fn writable(dir: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: c is a valid NUL-terminated path.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
 /// Where the root service remembers which system Flatpaks it has seen.
 pub fn system_state() -> PathBuf {
     std::env::var_os("ELAVO_APPLICATIONS_STATE")

@@ -10,13 +10,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use elavo_applications_core::reconcile::{self, Drop};
+use elavo_applications_core::settings::{self, AfterInstall};
 use elavo_applications_core::{
-    bundle, flatpak, icon, paths, running, trash, Bundle, Entry, Folder, Kind,
+    bundle, flatpak, icon, paths, place, running, trash, Bundle, Entry, Folder, Kind, Scope,
 };
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::prompt::{Prompt, Style};
+use crate::progress::{self, Progress};
+use crate::prompt::{Answer, Choice, Layout, Prompt, Style};
 
 const APP_ID: &str = "io.elavo.Applications";
 /// Files the service writes inside a bundle. Anything else that appears
@@ -31,10 +33,17 @@ const OWN_FILES: [&str; 7] = [
     icon::STANDARD,
 ];
 
-pub fn run() -> glib::ExitCode {
+/// `files` are AppImages and Flatpak files someone opened. Files hands them
+/// to the running service over D-Bus; this is for a launcher that runs the
+/// desktop file's `Exec` instead.
+pub fn run(files: &[String]) -> glib::ExitCode {
+    let mut flags = gio::ApplicationFlags::HANDLES_OPEN;
+    if files.is_empty() {
+        flags |= gio::ApplicationFlags::IS_SERVICE;
+    }
     let app = gtk::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::IS_SERVICE)
+        .flags(flags)
         .build();
     let started = Cell::new(false);
     let service: Rc<RefCell<Option<Rc<Service>>>> = Rc::default();
@@ -48,7 +57,18 @@ pub fn run() -> glib::ExitCode {
         slot.replace(Some(s));
     });
     app.connect_activate(|_| {});
-    let code = app.run_with_args::<&str>(&[]);
+    let slot = service.clone();
+    app.connect_open(move |_, files, _| {
+        if let Some(s) = slot.borrow().as_ref() {
+            for path in files.iter().filter_map(|f| f.path()) {
+                let s = s.clone();
+                glib::spawn_future_local(async move { s.opened(path).await });
+            }
+        }
+    });
+    let mut argv = vec!["elavo-applications".to_owned()];
+    argv.extend(files.iter().cloned());
+    let code = app.run_with_args(&argv);
     drop(service);
     code
 }
@@ -76,7 +96,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 struct Service {
     _hold: gio::ApplicationHoldGuard,
+    app: gtk::Application,
     prompt: Rc<Prompt>,
+    progress: RefCell<Vec<Rc<Progress>>>,
     /// Every bundle in both folders, by the path it has in its folder.
     known: RefCell<HashMap<PathBuf, Entry>>,
     /// Bundles this service moved or removed itself.
@@ -98,7 +120,9 @@ impl Service {
     fn new(app: &gtk::Application) -> Rc<Self> {
         let service = Rc::new(Service {
             _hold: app.hold(),
+            app: app.clone(),
             prompt: Prompt::new(app),
+            progress: RefCell::default(),
             known: RefCell::default(),
             expected_gone: RefCell::default(),
             busy: RefCell::default(),
@@ -333,6 +357,52 @@ impl Service {
         let _ = bundle::sync_exports(folder);
     }
 
+    /// Something the person installed is ready: opens it, or asks, as
+    /// `applications.conf` says.
+    async fn ready(self: &Rc<Self>, b: &Bundle) {
+        let open = match settings::after_install() {
+            AfterInstall::Open => true,
+            AfterInstall::Nothing => false,
+            AfterInstall::Ask => {
+                let answer = self
+                    .prompt
+                    .ask_with_check(
+                        &format!("“{}” is installed", b.entry.name),
+                        "Do you want to open it now?",
+                        &[("Not Now", Style::Plain), ("Open", Style::Suggested)],
+                        "Don’t ask again",
+                    )
+                    .await;
+                let Some(answer) = answer else { return };
+                let open = answer.index == 1;
+                if answer.checked {
+                    let remember = if open {
+                        AfterInstall::Open
+                    } else {
+                        AfterInstall::Nothing
+                    };
+                    let _ = settings::set_after_install(remember);
+                }
+                open
+            }
+        };
+        if !open {
+            return;
+        }
+        let info = gio_unix::DesktopAppInfo::from_filename(b.path.join(bundle::LAUNCH));
+        let context = gtk::gdk::Display::default().map(|d| d.app_launch_context());
+        let launched = match info {
+            Some(info) => info
+                .launch(&[], context.as_ref())
+                .map_err(|e| e.to_string()),
+            None => Err("Its launcher could not be read.".to_owned()),
+        };
+        if let Err(e) = launched {
+            self.prompt
+                .tell(&format!("“{}” could not be opened", b.entry.name), &e);
+        }
+    }
+
     async fn dropped(self: Rc<Self>, folder: Folder, path: PathBuf) {
         if !self.handling.borrow_mut().insert(path.clone()) {
             return;
@@ -355,7 +425,9 @@ impl Service {
                 }
             }
             Drop::AppImage => self.install_appimage(folder, path).await,
-            Drop::FlatpakRef | Drop::FlatpakBundle => self.install_flatpak(folder, path).await,
+            Drop::FlatpakRef | Drop::FlatpakBundle => {
+                self.install_flatpak(folder, path, true).await
+            }
         }
     }
 
@@ -397,7 +469,10 @@ impl Service {
         })
         .await;
         match result {
-            Ok(b) => self.after_install(folder, &b),
+            Ok(b) => {
+                self.after_install(folder, &b);
+                self.ready(&b).await;
+            }
             Err(e) => self.prompt.tell(
                 &format!("“{}” could not be installed", display_name(&path)),
                 &e,
@@ -405,10 +480,11 @@ impl Service {
         }
     }
 
-    async fn install_flatpak(self: &Rc<Self>, folder: Folder, path: PathBuf) {
-        let scope = folder.scope();
-        let p = path.clone();
-        let is_ref = reconcile::classify(&path) == Drop::FlatpakRef;
+    /// The application id a Flatpak file installs, or None after saying
+    /// it could not be read.
+    async fn flatpak_id(self: &Rc<Self>, path: &Path) -> Option<(String, flatpak::Source)> {
+        let p = path.to_path_buf();
+        let is_ref = reconcile::classify(path) == Drop::FlatpakRef;
         let id = blocking(move || {
             if is_ref {
                 flatpak::ref_name(&p)
@@ -419,43 +495,47 @@ impl Service {
         .await;
         let Some(id) = id else {
             self.prompt.tell(
-                &format!("“{}” could not be read", display_name(&path)),
+                &format!("“{}” could not be read", display_name(path)),
                 "It is not a Flatpak reference or bundle Elavo can install.",
             );
+            return None;
+        };
+        let source = if is_ref {
+            flatpak::Source::Ref(path.to_path_buf())
+        } else {
+            flatpak::Source::Bundle(path.to_path_buf())
+        };
+        Some((id, source))
+    }
+
+    /// Installs a Flatpak file into `folder`'s installation, showing its
+    /// progress. A file dropped into the folder is `consumed`: deleted once
+    /// installed.
+    async fn install_flatpak(self: &Rc<Self>, folder: Folder, path: PathBuf, consumed: bool) {
+        let scope = folder.scope();
+        let Some((id, source)) = self.flatpak_id(&path).await else {
             return;
         };
         if !self.busy.borrow_mut().insert(id.clone()) {
             return;
         }
-        let shown = id.rsplit('.').next().unwrap_or(&id).to_owned();
-        let notice = self.clone();
-        let notice_name = shown.clone();
-        glib::spawn_future_local(async move {
-            notice.prompt.tell(
-                &format!("Installing {notice_name}…"),
-                "It appears in Applications when it is ready.",
-            );
-        });
-        let p = path.clone();
-        let install_id = id.clone();
-        let result = blocking(move || {
-            if flatpak::is_installed(&install_id, scope) {
-                return Ok(());
+        let check = id.clone();
+        if !blocking(move || flatpak::is_installed(&check, scope)).await {
+            let name = flatpak::display_name(&id);
+            let p = path.clone();
+            let host = blocking(move || flatpak::ref_host(&p)).await;
+            let installed = self
+                .run_install(&name, host.as_deref(), &source, scope)
+                .await;
+            if !installed {
+                self.busy.borrow_mut().remove(&id);
+                return;
             }
-            if is_ref {
-                flatpak::install_ref(&p, scope)
-            } else {
-                flatpak::install_bundle(&p, scope)
-            }
-        })
-        .await;
-        self.busy.borrow_mut().remove(&id);
-        if let Err(e) = result {
-            self.prompt
-                .tell(&format!("{shown} could not be installed"), &e);
-            return;
         }
-        let _ = std::fs::remove_file(&path);
+        self.busy.borrow_mut().remove(&id);
+        if consumed {
+            let _ = std::fs::remove_file(&path);
+        }
         let dir = folder.dir();
         // The root service makes shared entries when the system Flatpaks
         // change. Making one here too would race it into a duplicate.
@@ -463,6 +543,7 @@ impl Service {
             for _ in 0..20 {
                 if let Some(b) = bundle::find(&dir, Kind::Flatpak, &id) {
                     self.after_install(folder, &b);
+                    self.ready(&b).await;
                     return;
                 }
                 sleep(500).await;
@@ -485,11 +566,144 @@ impl Service {
         })
         .await;
         match made {
-            Ok(b) => self.after_install(folder, &b),
+            Ok(b) => {
+                self.after_install(folder, &b);
+                self.ready(&b).await;
+            }
             Err(e) => self.prompt.tell(
                 "The application was installed, but its entry could not be made",
                 &e,
             ),
+        }
+    }
+
+    /// Runs `flatpak install` with a progress window, and offers Try Again
+    /// when it fails. False when it was cancelled or given up on.
+    async fn run_install(
+        self: &Rc<Self>,
+        name: &str,
+        host: Option<&str>,
+        source: &flatpak::Source,
+        scope: Scope,
+    ) -> bool {
+        let window = Progress::take(&self.progress, &self.app);
+        let server = host.unwrap_or("the Flatpak server");
+        let body = match host {
+            Some(host) => format!("Downloading from {host}…"),
+            None => "Installing…".to_owned(),
+        };
+        let installed = loop {
+            let actions = window.start(&format!("Installing {name}"), &body);
+            match install_with_progress(&window, actions, source, scope, server).await {
+                Ok(()) => break true,
+                Err(None) => break false,
+                Err(Some(why)) => {
+                    let answer = window
+                        .failed(&format!("{name} couldn't be installed"), &why)
+                        .recv()
+                        .await;
+                    if answer != Ok(progress::Action::Retry) {
+                        break false;
+                    }
+                }
+            }
+        };
+        window.finish();
+        installed
+    }
+
+    /// An AppImage or Flatpak file someone opened, from Downloads or
+    /// anywhere else.
+    async fn opened(self: Rc<Self>, path: PathBuf) {
+        if let Some(folder) = Folder::of(&path) {
+            self.dropped(folder, path).await;
+            return;
+        }
+        match reconcile::classify(&path) {
+            Drop::FlatpakRef | Drop::FlatpakBundle => self.offer_flatpak(path).await,
+            Drop::AppImage => self.offer_appimage(path).await,
+            Drop::Other | Drop::Ignore => self.prompt.tell(
+                &format!("“{}” can't be opened", display_name(&path)),
+                "Elavo opens AppImages and Flatpaks.",
+            ),
+        }
+    }
+
+    /// The folder "Install to Applications" puts things in: the shared one,
+    /// or this account's while Alt is held.
+    fn install_folder(alt: bool) -> Folder {
+        if alt || !Folder::Shared.dir().is_dir() {
+            Folder::Home
+        } else {
+            Folder::Shared
+        }
+    }
+
+    async fn offer_flatpak(self: &Rc<Self>, path: PathBuf) {
+        let Some((id, source)) = self.flatpak_id(&path).await else {
+            return;
+        };
+        let name = flatpak::display_name(&id);
+        let p = path.clone();
+        let host = blocking(move || flatpak::ref_host(&p)).await;
+        let kind = match source {
+            flatpak::Source::Ref(_) => "a Flatpak reference",
+            flatpak::Source::Bundle(_) => "a Flatpak bundle",
+        };
+        let from = host
+            .map(|h| format!(" It installs {name} from {h}."))
+            .unwrap_or_default();
+        let answer = self
+            .prompt
+            .choose(
+                &format!("Install {name}?"),
+                &format!(
+                    "“{}” is {kind} downloaded from the internet.{from} Install it only if you trust its developer.",
+                    display_name(&path)
+                ),
+                Layout::Stacked,
+                vec![
+                    Choice::new("Install to Applications", Style::Suggested)
+                        .alt("Install to Applications (User)"),
+                    Choice::new("Cancel", Style::Plain),
+                ],
+            )
+            .await;
+        if let Some(Answer { index: 0, alt, .. }) = answer {
+            self.install_flatpak(Self::install_folder(alt), path, false)
+                .await;
+        }
+    }
+
+    async fn offer_appimage(self: &Rc<Self>, path: PathBuf) {
+        let p = path.clone();
+        let inspected = blocking(move || bundle::inspect_appimage(&p)).await;
+        let answer = self
+            .prompt
+            .choose(
+                &format!("Install “{}”?", inspected.name),
+                &format!(
+                    "“{}” is an application downloaded from the internet. Install it only if you trust its developer.",
+                    display_name(&path)
+                ),
+                Layout::Stacked,
+                vec![
+                    Choice::new("Install to Applications", Style::Suggested)
+                        .alt("Install to Applications (User)"),
+                    Choice::new("Cancel", Style::Plain),
+                ],
+            )
+            .await;
+        drop(inspected);
+        if let Some(Answer { index: 0, alt, .. }) = answer {
+            let folder = Self::install_folder(alt);
+            let p = path.clone();
+            if let Err(e) = blocking(move || place::place(&p, folder)).await {
+                self.prompt.tell(
+                    &format!("“{}” could not be installed", display_name(&path)),
+                    &e,
+                );
+            }
         }
     }
 
@@ -752,6 +966,150 @@ async fn wait_settled(path: &Path) -> bool {
             return true;
         }
         last = now;
+    }
+}
+
+/// How long a download may go without progress before it counts as stuck.
+const STALLED: Duration = Duration::from_secs(120);
+
+enum Event {
+    Line(String),
+    Stderr(String),
+    Exit(bool),
+    Cancel,
+    Tick,
+}
+
+/// One run of `flatpak install`, feeding `window`'s bar. `Err(None)` when
+/// it was cancelled, otherwise what to tell the person.
+async fn install_with_progress(
+    window: &Rc<Progress>,
+    actions: async_channel::Receiver<progress::Action>,
+    source: &flatpak::Source,
+    scope: Scope,
+    server: &str,
+) -> Result<(), Option<String>> {
+    let mut child = flatpak::install_command(source, scope)
+        .spawn()
+        .map_err(|e| Some(format!("flatpak: {e}")))?;
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = async_channel::unbounded();
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            read_updates(stdout, |line| {
+                let _ = tx.send_blocking(Event::Line(line));
+            })
+        });
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+            let _ = tx.send_blocking(Event::Stderr(text));
+        });
+    }
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let ok = child.wait().is_ok_and(|s| s.success());
+            let _ = tx.send_blocking(Event::Exit(ok));
+        });
+    }
+    {
+        let tx = tx.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(action) = actions.recv().await {
+                if action == progress::Action::Cancel {
+                    let _ = tx.send(Event::Cancel).await;
+                }
+            }
+        });
+    }
+    glib::timeout_add_local(Duration::from_secs(5), move || {
+        if tx.try_send(Event::Tick).is_ok() {
+            glib::ControlFlow::Continue
+        } else {
+            glib::ControlFlow::Break
+        }
+    });
+
+    #[derive(PartialEq)]
+    enum Stop {
+        Cancelled,
+        Stalled,
+    }
+    let mut last = std::time::Instant::now();
+    let mut fraction = 0.0_f64;
+    // Between downloads, flatpak may be waiting for a password.
+    let mut downloading = true;
+    let (mut exited, mut stderr, mut stop) = (None, None, None);
+    while let Ok(event) = rx.recv().await {
+        match event {
+            Event::Line(line) => {
+                last = std::time::Instant::now();
+                if let Some(f) = flatpak::progress(&line) {
+                    downloading = !line.contains("100%");
+                    fraction = fraction.max(f);
+                    window.set_fraction(fraction);
+                }
+            }
+            Event::Stderr(text) => stderr = Some(text),
+            Event::Exit(ok) => exited = Some(ok),
+            Event::Cancel if stop.is_none() && exited.is_none() => {
+                stop = Some(Stop::Cancelled);
+                // SAFETY: pid is our child, which has not been reaped yet.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            Event::Tick
+                if stop.is_none()
+                    && exited.is_none()
+                    && downloading
+                    && last.elapsed() > STALLED =>
+            {
+                stop = Some(Stop::Stalled);
+                // SAFETY: as above.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            Event::Cancel | Event::Tick => {}
+        }
+        if let (Some(ok), Some(err)) = (exited, stderr.as_deref()) {
+            return match stop {
+                Some(Stop::Cancelled) => Err(None),
+                Some(Stop::Stalled) => Err(Some(format!(
+                    "The download from {server} stopped. Check the internet connection, then try again."
+                ))),
+                None if ok || flatpak::already_installed(err) => Ok(()),
+                None => Err(Some(flatpak::explain_failure(err, server))),
+            };
+        }
+    }
+    Err(Some("Flatpak stopped without saying why.".to_owned()))
+}
+
+/// Calls `line` for each line of `from`. Progress updates end in a carriage
+/// return or a newline.
+fn read_updates(mut from: impl std::io::Read, mut line: impl FnMut(String)) {
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = from.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        for &byte in &chunk[..n] {
+            if byte == b'\n' || byte == b'\r' {
+                if !pending.is_empty() {
+                    line(String::from_utf8_lossy(&pending).into_owned());
+                    pending.clear();
+                }
+            } else {
+                pending.push(byte);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        line(String::from_utf8_lossy(&pending).into_owned());
     }
 }
 

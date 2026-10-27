@@ -2,7 +2,8 @@
 Type=Application
 Name=Applications
 Comment=Installs what is dropped into the Applications folder
-Exec=/usr/bin/elavo-applications
+Exec=/usr/bin/elavo-applications %F
 Icon=folder-applications
 NoDisplay=true
 DBusActivatable=true
+MimeType=application/vnd.flatpak.ref;application/vnd.flatpak;application/vnd.appimage;application/x-iso9660-appimage;

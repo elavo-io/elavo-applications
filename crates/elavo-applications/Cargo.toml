@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 elavo-applications-core.workspace = true
+gio-unix.workspace = true
 gtk.workspace = true
 libc.workspace = true
 async-channel = "2"

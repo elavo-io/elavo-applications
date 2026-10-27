@@ -19,7 +19,6 @@ use gio::glib;
 use gio::prelude::*;
 
 const USAGE: &str = "usage: elavo-applications-ctl launch <id> | install <file> [--shared] | remove <bundle> | running <bundle> | shortcut <bundle> <dir> | list | inspect <appimage>";
-const HELPER: &str = "/usr/libexec/elavo-applications-helper";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -113,46 +112,9 @@ fn tell_service(action: &str, value: &str) {
     );
 }
 
-fn writable(dir: &Path) -> bool {
-    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
-    // SAFETY: c is a valid NUL-terminated path.
-    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
-}
-
-/// Puts `file` in an Applications folder; the service installs it from
-/// there. A standard account installing for everyone goes through the root
-/// helper, which asks for an administrator's password.
 fn install(file: &Path, shared: bool) -> Result<(), String> {
-    let file = file
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", file.display()))?;
     let folder = if shared { Folder::Shared } else { Folder::Home };
-    let dir = folder.dir();
-    if shared && !writable(&dir) {
-        let status = std::process::Command::new("pkexec")
-            .arg(HELPER)
-            .arg("install-shared")
-            .arg(&file)
-            .status()
-            .map_err(|e| format!("pkexec: {e}"))?;
-        return if status.success() {
-            Ok(())
-        } else {
-            Err("The administrator password was not accepted.".to_owned())
-        };
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = file.file_name().ok_or("not a file")?;
-    let target = dir.join(name);
-    if target.exists() {
-        return Err(format!("{} already exists", target.display()));
-    }
-    if std::fs::rename(&file, &target).is_err() {
-        std::fs::copy(&file, &target).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    elavo_applications_core::place::place(file, folder)
 }
 
 /// The same gesture as dragging the bundle to the Trash.

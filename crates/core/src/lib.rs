@@ -12,8 +12,10 @@ pub mod flatpak;
 pub mod icon;
 pub mod keyfile;
 pub mod paths;
+pub mod place;
 pub mod reconcile;
 pub mod running;
+pub mod settings;
 pub mod system;
 pub mod trash;
 
