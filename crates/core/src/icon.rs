@@ -84,8 +84,8 @@ pub fn resolve(bundle: &Path, id: &str, own: Option<&str>) -> Icon {
     if let Some(path) = custom(bundle) {
         return Icon::File(path);
     }
-    if let Some(name) = [Some(id), own].into_iter().flatten().find(|n| theme_has(n)) {
-        return Icon::Name(name.to_owned());
+    if let Some(name) = theme_names(id, own).into_iter().find(|n| theme_has(n)) {
+        return Icon::Name(name);
     }
     if let Some(path) = standard(bundle, own) {
         return Icon::File(path);
@@ -98,6 +98,26 @@ pub fn resolve(bundle: &Path, id: &str, own: Option<&str>) -> Icon {
         Some(n) if !n.contains('/') => Icon::Name(n.to_owned()),
         _ => Icon::Name(FALLBACK.to_owned()),
     }
+}
+
+/// Names to look for in the Elavo theme, in order. The application's id,
+/// then the icon its own desktop file names, then the older GNOME name
+/// (`org.gnome.Aisleriot` is drawn as `gnome-aisleriot`).
+fn theme_names(id: &str, own: Option<&str>) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut push = |name: &str| {
+        if !name.is_empty() && !name.contains('/') && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    };
+    push(id);
+    if let Some(own) = own {
+        push(own);
+    }
+    if let Some(rest) = id.strip_prefix("org.gnome.") {
+        push(&format!("gnome-{}", rest.to_ascii_lowercase()));
+    }
+    names
 }
 
 fn template_dir() -> Option<PathBuf> {
@@ -313,6 +333,18 @@ mod tests {
             Icon::File(dir.join("custom-icon.png"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gnome_apps_keep_their_older_icon_name() {
+        assert_eq!(
+            theme_names("org.gnome.Aisleriot", Some("org.gnome.Aisleriot")),
+            ["org.gnome.Aisleriot", "gnome-aisleriot"]
+        );
+        assert_eq!(
+            theme_names("com.rtsoft.patchy", Some("com.rtsoft.patchy")),
+            ["com.rtsoft.patchy"]
+        );
     }
 
     #[test]

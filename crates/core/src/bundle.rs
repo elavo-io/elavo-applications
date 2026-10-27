@@ -176,8 +176,20 @@ pub fn launch_desktop(path: &Path, entry: &Entry) -> KeyFile {
 
 /// Rewrites `launch.desktop` and, for an AppImage, its `run` script.
 pub fn refresh(bundle: &Bundle) -> crate::Result<()> {
-    if let Some(name) = (bundle.entry.kind == Kind::Appimage).then_some(&bundle.entry.source) {
-        write_file(&bundle.path.join(RUN), run_script(name).as_bytes(), 0o755)?;
+    if bundle.entry.kind == Kind::Appimage {
+        write_file(
+            &bundle.path.join(RUN),
+            run_script(&bundle.entry.source).as_bytes(),
+            0o755,
+        )?;
+        // A DwarFS AppImage installed before dwarfsextract was available has
+        // no original desktop file and no icon. Read it now, then stop.
+        if !bundle.path.join(ORIGINAL).is_file() {
+            if let Some(file) = bundle.appimage().filter(|p| appimage::is_dwarfs(p)) {
+                let inspected = inspect_appimage(&file);
+                let _ = store_appimage(&bundle.path, &inspected.info);
+            }
+        }
     }
     let text = launch_desktop(&bundle.path, &bundle.entry).render();
     write_file(&bundle.path.join(LAUNCH), text.as_bytes(), 0o644)
@@ -262,20 +274,7 @@ pub fn install_appimage(
     }
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| e.to_string())?;
-    if let Some(desktop) = &inspected.info.desktop {
-        write_file(&path.join(ORIGINAL), desktop.render().as_bytes(), 0o644)?;
-    }
-    if let Some(icon) = &inspected.info.icon {
-        let name = if icon.extension().is_some_and(|e| e == "svg") || sniff_svg(icon) {
-            "icon.svg"
-        } else {
-            "icon.png"
-        };
-        for old in icon::BUNDLED {
-            let _ = std::fs::remove_file(path.join(old));
-        }
-        let _ = std::fs::copy(icon, path.join(name));
-    }
+    store_appimage(&path, &inspected.info)?;
     let entry = Entry {
         kind: Kind::Appimage,
         id: inspected.id.clone(),
@@ -291,6 +290,25 @@ pub fn install_appimage(
     let bundle = Bundle { path, entry };
     refresh(&bundle)?;
     Ok(bundle)
+}
+
+/// Copies the desktop file and icon `read` found into the bundle.
+fn store_appimage(dir: &Path, info: &appimage::Info) -> crate::Result<()> {
+    if let Some(desktop) = &info.desktop {
+        write_file(&dir.join(ORIGINAL), desktop.render().as_bytes(), 0o644)?;
+    }
+    if let Some(icon) = &info.icon {
+        let name = if icon.extension().is_some_and(|e| e == "svg") || sniff_svg(icon) {
+            "icon.svg"
+        } else {
+            "icon.png"
+        };
+        for old in icon::BUNDLED {
+            let _ = std::fs::remove_file(dir.join(old));
+        }
+        let _ = std::fs::copy(icon, dir.join(name));
+    }
+    Ok(())
 }
 
 fn sniff_svg(path: &Path) -> bool {

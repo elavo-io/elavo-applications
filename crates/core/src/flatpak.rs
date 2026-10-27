@@ -1,6 +1,7 @@
 //! The `flatpak` commands the folder runs, and where an installation keeps
 //! its exported desktop files and icons.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -228,16 +229,44 @@ pub fn ref_name(file: &Path) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
-/// The application id inside a `.flatpak` bundle.
+/// The application id inside a `.flatpak` bundle, such as `com.rtsoft.patchy`.
+///
+/// `flatpak` has no command that prints this. The file starts with the
+/// marker `flatpak`, the constant `0xe5890001`, and a ref
+/// `app/<id>/<arch>/<branch>`.
 pub fn bundle_name(file: &Path) -> Option<String> {
-    let path = file.to_string_lossy();
-    let text = output(&["info", "--show-ref", "--file", &path])
-        .or_else(|_| output(&["build-bundle-info", &path]))
-        .ok()?;
-    text.lines()
-        .find_map(|l| l.trim().strip_prefix("app/"))
-        .and_then(|r| r.split('/').next())
-        .map(str::to_owned)
+    let mut head = [0u8; 4096];
+    let n = std::fs::File::open(file).ok()?.read(&mut head).ok()?;
+    app_id_in_bundle(&head[..n]).map(str::to_owned)
+}
+
+fn app_id_in_bundle(head: &[u8]) -> Option<&str> {
+    if head.len() < 16 || &head[..8] != b"flatpak\0" || head[8..12] != [0x01, 0x00, 0x89, 0xe5] {
+        return None;
+    }
+    let start = head[12..].windows(4).position(|w| w == b"app/")?;
+    let bytes = &head[12 + start..];
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let reff = std::str::from_utf8(&bytes[..end]).ok()?;
+    let mut parts = reff.split('/');
+    if parts.next() != Some("app") {
+        return None;
+    }
+    let id = parts.next()?;
+    let arch = parts.next()?;
+    let branch = parts.next()?;
+    if parts.next().is_some() || arch.is_empty() || branch.is_empty() {
+        return None;
+    }
+    let id_ok = id.contains('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+    if id_ok {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 pub fn installation(scope: Scope) -> PathBuf {
@@ -331,5 +360,17 @@ mod tests {
         .unwrap();
         assert_eq!(ref_host(&file).as_deref(), Some("dl.flathub.org"));
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn bundle_header_names_the_app() {
+        let mut head = b"flatpak\0\x01\x00\x89\xe5".to_vec();
+        head.extend_from_slice(b"\0ref\0\0\0\0\0app/com.rtsoft.patchy/x86_64/master\0");
+        assert_eq!(app_id_in_bundle(&head), Some("com.rtsoft.patchy"));
+        assert_eq!(app_id_in_bundle(b"flatpak\0not-a-bundle"), None);
+        assert_eq!(
+            app_id_in_bundle(b"flatpak\0\x01\x00\x89\xe5runtime/org.kde.Platform/x86_64/6.11\0"),
+            None
+        );
     }
 }

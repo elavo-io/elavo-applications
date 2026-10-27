@@ -1,8 +1,8 @@
 //! Reading an AppImage without running it. A type 2 AppImage is an ELF
-//! runtime followed by a squashfs image; the image starts where the ELF's
-//! section header table ends. `unsquashfs -o` reads the desktop file and the
-//! icon from there. `--appimage-extract` would run code the person has not
-//! chosen to run yet.
+//! runtime followed by a filesystem image; the image starts where the ELF's
+//! section header table ends. The image is squashfs (`unsquashfs -o`) or
+//! DwarFS (`dwarfsextract`). Either one reads the desktop file and the icon.
+//! `--appimage-extract` would run code the person has not chosen to run yet.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -46,8 +46,45 @@ pub fn appimage_type(header: &[u8]) -> Option<u8> {
     Some(header[10])
 }
 
-/// Where the squashfs image starts: the end of the ELF section headers.
-pub fn squashfs_offset(header: &[u8]) -> Option<u64> {
+/// Which filesystem follows the runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Payload {
+    Squashfs,
+    Dwarfs,
+}
+
+/// `DWARFS` or a squashfs magic (`hsqs`, `sqsh`) at the start of the image.
+pub fn payload(magic: &[u8]) -> Option<Payload> {
+    if magic.len() >= 6 && &magic[..6] == b"DWARFS" {
+        Some(Payload::Dwarfs)
+    } else if magic.len() >= 4 && (&magic[..4] == b"hsqs" || &magic[..4] == b"sqsh") {
+        Some(Payload::Squashfs)
+    } else {
+        None
+    }
+}
+
+/// Whether the file is an AppImage whose image is DwarFS.
+pub fn is_dwarfs(path: &Path) -> bool {
+    let Some((head, len)) = header(path) else {
+        return false;
+    };
+    let Some(offset) = image_offset(&head).filter(|o| *o < len) else {
+        return false;
+    };
+    payload_at(path, offset) == Some(Payload::Dwarfs)
+}
+
+fn payload_at(path: &Path, offset: u64) -> Option<Payload> {
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut magic = [0u8; 8];
+    let n = file.read(&mut magic).ok()?;
+    payload(&magic[..n])
+}
+
+/// Where the filesystem image starts: the end of the ELF section headers.
+pub fn image_offset(header: &[u8]) -> Option<u64> {
     if header.len() < 64 || &header[0..4] != b"\x7fELF" {
         return None;
     }
@@ -96,14 +133,36 @@ pub fn is_appimage(path: &Path) -> bool {
     header(path).is_some_and(|(h, _)| appimage_type(&h).is_some())
 }
 
-fn unsquash(file: &Path, offset: u64, dest: &Path, items: &[&str]) -> bool {
-    Command::new("unsquashfs")
-        .arg("-o")
-        .arg(offset.to_string())
-        .args(["-q", "-n", "-f", "-no-xattrs", "-d"])
-        .arg(dest)
-        .arg(file)
-        .args(items)
+fn extract(file: &Path, offset: u64, dest: &Path, items: &[&str]) -> bool {
+    let mut command = match payload_at(file, offset) {
+        Some(Payload::Dwarfs) => {
+            let mut command = Command::new("dwarfsextract");
+            command
+                .arg("-i")
+                .arg(file)
+                .arg("-o")
+                .arg(dest)
+                .arg("-O")
+                .arg(offset.to_string())
+                .args(["--skip-devices", "--skip-specials"]);
+            for item in items {
+                command.arg("--pattern").arg(item);
+            }
+            command
+        }
+        _ => {
+            let mut command = Command::new("unsquashfs");
+            command
+                .arg("-o")
+                .arg(offset.to_string())
+                .args(["-q", "-n", "-f", "-no-xattrs", "-d"])
+                .arg(dest)
+                .arg(file)
+                .args(items);
+            command
+        }
+    };
+    command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -129,7 +188,7 @@ fn resolve_in_image(file: &Path, offset: u64, dest: &Path, mut rel: PathBuf) -> 
         let next = normalize(&next)?;
         let item = next.to_str()?.to_owned();
         let _ = std::fs::remove_file(&at);
-        if !unsquash(file, offset, dest, &[&item]) {
+        if !extract(file, offset, dest, &[&item]) {
             return None;
         }
         rel = next;
@@ -167,10 +226,10 @@ pub fn read(file: &Path, scratch: &Path) -> Info {
     if appimage_type(&head) != Some(2) {
         return info;
     }
-    let Some(offset) = squashfs_offset(&head).filter(|o| *o < len) else {
+    let Some(offset) = image_offset(&head).filter(|o| *o < len) else {
         return info;
     };
-    if !unsquash(file, offset, scratch, &["*.desktop", ".DirIcon"]) {
+    if !extract(file, offset, scratch, &["*.desktop", ".DirIcon"]) {
         return info;
     }
     let desktop = std::fs::read_dir(scratch)
@@ -193,7 +252,7 @@ pub fn read(file: &Path, scratch: &Path) -> Info {
         if let Some(name) = icon_name.filter(|n| !n.contains('/')) {
             for ext in ["png", "svg"] {
                 let item = format!("{name}.{ext}");
-                if unsquash(file, offset, scratch, &[&item]) {
+                if extract(file, offset, scratch, &[&item]) {
                     if let Some(found) =
                         resolve_in_image(file, offset, scratch, PathBuf::from(&item))
                     {
@@ -256,10 +315,36 @@ mod tests {
     #[test]
     fn offset_is_end_of_section_headers() {
         let h = elf64(186_000, 64, 31, true);
-        assert_eq!(squashfs_offset(&h), Some(186_000 + 64 * 31));
+        assert_eq!(image_offset(&h), Some(186_000 + 64 * 31));
         assert_eq!(appimage_type(&h), Some(2));
         assert_eq!(appimage_type(&elf64(0, 0, 0, false)), None);
-        assert_eq!(squashfs_offset(b"not an elf"), None);
+        assert_eq!(image_offset(b"not an elf"), None);
+    }
+
+    #[test]
+    fn payload_magic() {
+        assert_eq!(payload(b"DWARFS\x02\x05"), Some(Payload::Dwarfs));
+        assert_eq!(payload(b"hsqs...."), Some(Payload::Squashfs));
+        assert_eq!(payload(b"sqsh...."), Some(Payload::Squashfs));
+        assert_eq!(payload(b"notanimage"), None);
+    }
+
+    #[test]
+    fn dwarfs_is_recognized_at_the_image_offset() {
+        let offset = 186_000 + 64 * 31;
+        let mut bytes = elf64(186_000, 64, 31, true);
+        bytes.resize(offset as usize + 8, 0);
+        bytes[offset as usize..offset as usize + 6].copy_from_slice(b"DWARFS");
+        let dir = std::env::temp_dir().join(format!("eapp-dwarfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Brave.AppImage");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(is_dwarfs(&path));
+        bytes[offset as usize..offset as usize + 4].copy_from_slice(b"hsqs");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!is_dwarfs(&path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
