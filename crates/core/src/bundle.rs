@@ -108,9 +108,13 @@ fn run_script(appimage: &str) -> String {
         "#!/bin/sh\n\
          # Written by elavo-applications. Starts the AppImage from its bundle,\n\
          # with the Elavo theme where the AppImage uses the system's GTK.\n\
+         # GTK_THEME overrides the dark preference, so it names the variant.\n\
          cd \"$(dirname \"$0\")\" || exit 1\n\
          if [ -z \"${{GTK_THEME:-}}\" ] && [ -d /usr/share/themes/Elavo ]; then\n\
-         \x20   export GTK_THEME=Elavo\n\
+         \x20   case \"$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)\" in\n\
+         \x20       *dark*) export GTK_THEME=Elavo:dark ;;\n\
+         \x20       *) export GTK_THEME=Elavo ;;\n\
+         \x20   esac\n\
          fi\n\
          export XDG_DATA_DIRS=\"${{XDG_DATA_DIRS:-/usr/local/share:/usr/share}}\"\n\
          exec ./{} \"$@\"\n",
@@ -581,6 +585,7 @@ mod tests {
             Some(format!("{run} --new").as_str())
         );
         assert!(run_script("it's.AppImage").contains("exec ./'it'\\''s.AppImage' \"$@\""));
+        assert!(run_script("a.AppImage").contains("*dark*) export GTK_THEME=Elavo:dark ;;"));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
