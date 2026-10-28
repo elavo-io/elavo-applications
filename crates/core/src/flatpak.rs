@@ -182,7 +182,12 @@ pub fn explain_failure(stderr: &str, host: &str) -> String {
         format!("{host} took too long to respond. Check the internet connection, then try again.")
     } else if says(&["no space left"]) {
         "There isn't enough free space on this computer.".to_owned()
-    } else if says(&["not authorized", "authentication", "polkit"]) {
+    } else if says(&[
+        "not authorized",
+        "not allowed for user",
+        "authentication",
+        "polkit",
+    ]) {
         "Installing for every account on this computer needs an administrator's password."
             .to_owned()
     } else if says(&["gpg", "signature"]) {

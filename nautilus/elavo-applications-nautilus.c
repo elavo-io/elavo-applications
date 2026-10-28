@@ -616,9 +616,12 @@ watch_view(GtkWidget *view)
         g_warning("elavo applications: no view actions found");
         return;
     }
+    /* Nautilus 50's names. /Applications cannot be trashed, so there Nautilus
+     * offers only the permanent deletes. */
     wrap_action(map, "move-to-trash", view);
-    wrap_action(map, "delete-permanently", view);
-    wrap_action(map, "permanent-delete", view);
+    wrap_action(map, "delete-permanently-shortcut", view);
+    wrap_action(map, "delete-permanently-menu-item", view);
+    wrap_action(map, "permanent-delete-permanently-menu-item", view);
 }
 
 /* ---- Labels ---- */

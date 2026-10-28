@@ -49,9 +49,13 @@ pub fn run() -> ExitCode {
         }
     }
 
+    // An entry is made once, when its Flatpak is first seen. A person who
+    // deletes a shared entry is asked Uninstall or Keep by their own
+    // service, so an entry written back here would beat that question.
+    let seen = seen_flatpaks();
     let mirror = reconcile::mirror(
         folder,
-        |id| trash::holds_app(&dir, id, true),
+        |id| trash::holds_app(&dir, id, true) || seen.as_ref().is_some_and(|s| s.contains(id)),
         &HashSet::new(),
     );
     match mirror {
@@ -61,6 +65,12 @@ pub fn run() -> ExitCode {
             }
         }
         Err(e) => fail("flatpak", e),
+    }
+    if let Some(installed) = flatpak::list(folder.scope()) {
+        let ids: Vec<&str> = installed.iter().map(|a| a.id.as_str()).collect();
+        if let Err(e) = save_seen_flatpaks(&ids) {
+            fail("state", e);
+        }
     }
 
     for b in bundle::list(&dir) {
@@ -100,6 +110,34 @@ fn install(folder: Folder, path: &Path) -> Result<(), String> {
         }
         Drop::Other | Drop::Ignore => Ok(()),
     }
+}
+
+fn seen_path() -> std::path::PathBuf {
+    paths::system_state().join("seen-flatpaks")
+}
+
+/// The system Flatpaks the last pass saw. None before the first pass, so
+/// that pass makes an entry for every installed Flatpak.
+fn seen_flatpaks() -> Option<HashSet<String>> {
+    let text = std::fs::read_to_string(seen_path()).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// An uninstalled Flatpak drops out, so installing it again makes an entry.
+fn save_seen_flatpaks(ids: &[&str]) -> Result<(), String> {
+    let mut text = ids.join("\n");
+    text.push('\n');
+    let path = seen_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    bundle::write_file(&path, text.as_bytes(), 0o644)
 }
 
 /// Root made this bundle; administrators must still be able to delete it.

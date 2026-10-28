@@ -73,6 +73,10 @@ pub struct Prompt {
     buttons: gtk::Box,
     /// The shown buttons with their two labels.
     shown: RefCell<Vec<(gtk::Button, String, Option<String>)>>,
+    /// The previous question's buttons. The clicked one is still in its
+    /// clicked handler when the next question replaces it, so it is kept
+    /// alive until the question after.
+    retired: RefCell<Vec<gtk::Widget>>,
     alt: Cell<bool>,
     queue: RefCell<VecDeque<Ask>>,
     current: RefCell<Option<async_channel::Sender<Option<Answer>>>>,
@@ -124,6 +128,7 @@ impl Prompt {
             check,
             buttons,
             shown: RefCell::default(),
+            retired: RefCell::default(),
             alt: Cell::new(false),
             queue: RefCell::default(),
             current: RefCell::default(),
@@ -276,9 +281,12 @@ impl Prompt {
         self.check.set_active(false);
         self.check.set_label(ask.check.as_deref());
         self.check.set_visible(ask.check.is_some());
+        let mut retired = Vec::new();
         while let Some(child) = self.buttons.first_child() {
             self.buttons.remove(&child);
+            retired.push(child);
         }
+        self.retired.replace(retired);
         let stacked = ask.layout == Layout::Stacked;
         self.buttons.set_orientation(if stacked {
             gtk::Orientation::Vertical

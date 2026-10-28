@@ -83,7 +83,9 @@ fn install_shared(file: &Path) -> Result<(), String> {
             target = dir.join(format!("{n} {name}"));
             n += 1;
         }
-        std::fs::rename(&tmp, &target).map_err(|e| e.to_string())
+        std::fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
+        println!("{}", target.display());
+        Ok(())
     })();
     if copied.is_err() {
         let _ = std::fs::remove_file(&tmp);

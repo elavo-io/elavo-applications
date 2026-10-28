@@ -1,6 +1,6 @@
 //! Putting a file in an Applications folder, where a service installs it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::paths::{self, Folder};
 
@@ -15,17 +15,7 @@ pub fn place(file: &Path, folder: Folder) -> crate::Result<()> {
         .map_err(|e| format!("{}: {e}", file.display()))?;
     let dir = folder.dir();
     if folder == Folder::Shared && !paths::writable(&dir) {
-        let status = std::process::Command::new("pkexec")
-            .arg(HELPER)
-            .arg("install-shared")
-            .arg(&file)
-            .status()
-            .map_err(|e| format!("pkexec: {e}"))?;
-        return if status.success() {
-            Ok(())
-        } else {
-            Err("The administrator password was not accepted.".to_owned())
-        };
+        return copy_as_root(&file).map(drop);
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let name = file.file_name().ok_or("not a file")?;
@@ -37,4 +27,22 @@ pub fn place(file: &Path, folder: Folder) -> crate::Result<()> {
         std::fs::copy(&file, &target).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Copies `file` into `/Applications` as root, through `pkexec`, which asks
+/// for an administrator's password. The root service installs files root
+/// owns. Returns where the copy is.
+pub fn copy_as_root(file: &Path) -> crate::Result<PathBuf> {
+    let out = std::process::Command::new("pkexec")
+        .arg(HELPER)
+        .arg("install-shared")
+        .arg(file)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("pkexec: {e}"))?;
+    if !out.status.success() {
+        return Err("The administrator password was not accepted.".to_owned());
+    }
+    let printed = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    Ok(PathBuf::from(printed))
 }

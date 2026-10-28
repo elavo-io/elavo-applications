@@ -344,6 +344,11 @@ impl Service {
         if exists && paths::is_bundle(&path) && path.is_dir() {
             if !self.known.borrow().contains_key(&path) {
                 self.appeared(folder, path);
+            } else if let Some(b) = Bundle::read(&path) {
+                // The same name can be a new directory, written again by the
+                // root service, without the old one's Files icon.
+                set_file_icon(&b);
+                self.known.borrow_mut().insert(path, b.entry);
             }
             return;
         }
@@ -539,6 +544,18 @@ impl Service {
         let check = id.clone();
         if !blocking(move || flatpak::is_installed(&check, scope)).await {
             let name = flatpak::display_name(&id);
+            if scope == Scope::System && matches!(source, flatpak::Source::Bundle(_)) {
+                let installed = self.install_bundle_as_root(&name, &path, &id).await;
+                self.busy.borrow_mut().remove(&id);
+                if !installed {
+                    return;
+                }
+                if consumed {
+                    let _ = std::fs::remove_file(&path);
+                }
+                self.wait_for_shared_entry(&id).await;
+                return;
+            }
             let p = path.clone();
             let host = blocking(move || flatpak::ref_host(&p)).await;
             let installed = self
@@ -591,6 +608,73 @@ impl Service {
                 "The application was installed, but its entry could not be made",
                 &e,
             ),
+        }
+    }
+
+    /// A bundle installed for every account adds a Flatpak remote for its
+    /// updates. Flatpak's system helper checks that without letting polkit
+    /// ask for the password it needs, so the install fails with nothing
+    /// shown. The root helper copies the file in through `pkexec`, which
+    /// asks, and the root service installs it as root.
+    async fn install_bundle_as_root(self: &Rc<Self>, name: &str, path: &Path, id: &str) -> bool {
+        let window = Progress::take(&self.progress, &self.app);
+        let _ = window.start(
+            &format!("Installing {name}"),
+            "Installing for every account needs an administrator's password.",
+        );
+        let p = path.to_path_buf();
+        let copied = match blocking(move || place::copy_as_root(&p)).await {
+            Ok(copy) => copy,
+            Err(e) => {
+                window.finish();
+                self.prompt
+                    .tell(&format!("{name} couldn't be installed"), &e);
+                return false;
+            }
+        };
+        let actions = window.start(
+            &format!("Installing {name}"),
+            "Installing for every account…",
+        );
+        let mut hidden = false;
+        // The root service removes its copy once the install worked, and
+        // leaves it when it failed.
+        for _ in 0..1200 {
+            if !hidden && actions.try_recv() == Ok(progress::Action::Cancel) {
+                window.finish();
+                hidden = true;
+            }
+            let check = id.to_owned();
+            if blocking(move || flatpak::is_installed(&check, Scope::System)).await {
+                if !hidden {
+                    window.finish();
+                }
+                return true;
+            }
+            sleep(500).await;
+        }
+        if !hidden {
+            window.finish();
+        }
+        self.prompt.tell(
+            &format!("{name} couldn't be installed"),
+            &format!(
+                "The install for every account did not finish. {} is still in Applications.",
+                display_name(&copied)
+            ),
+        );
+        false
+    }
+
+    async fn wait_for_shared_entry(self: &Rc<Self>, id: &str) {
+        let dir = Folder::Shared.dir();
+        for _ in 0..40 {
+            if let Some(b) = bundle::find(&dir, Kind::Flatpak, id) {
+                self.after_install(Folder::Shared, &b);
+                self.ready(&b).await;
+                return;
+            }
+            sleep(500).await;
         }
     }
 
