@@ -8,6 +8,9 @@
  * - Move to Trash and Delete refuse an entry whose application is running.
  *   The view's actions are replaced by wrappers that check first and then
  *   call Nautilus's own action. Emission hooks cannot stop a signal.
+ * - /Applications is on /var, which GIO will not trash. Move to Trash and
+ *   Delete there ask the service (elavo-applications-ctl remove) and leave
+ *   the entry in place until Uninstall. The home folder still uses Trash.
  * - A drag that starts on an entry never moves or copies the install.
  *   Wayland has no link action, so the drag offers a copy. Dropped in a
  *   Files window, on a folder, a sidebar place, or the path bar, the entry
@@ -186,21 +189,28 @@ ancestor(GtkWidget *widget, GType type)
     return type && widget ? gtk_widget_get_ancestor(widget, type) : NULL;
 }
 
+static GtkSelectionModel *
+selection_model(GtkWidget *view)
+{
+    GtkWidget *list = find_descendant(view, GTK_TYPE_GRID_VIEW);
+
+    if (list)
+        return gtk_grid_view_get_model(GTK_GRID_VIEW(list));
+    if ((list = find_descendant(view, GTK_TYPE_COLUMN_VIEW)))
+        return gtk_column_view_get_model(GTK_COLUMN_VIEW(list));
+    return NULL;
+}
+
 /* The paths of the selected items in a files view. */
 static GPtrArray *
 selected_paths(GtkWidget *view)
 {
     GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
-    GtkWidget *list = find_descendant(view, GTK_TYPE_GRID_VIEW);
-    GtkSelectionModel *model = NULL;
+    GtkSelectionModel *model = selection_model(view);
     GtkBitset *selection;
     GtkBitsetIter iter;
     guint position;
 
-    if (list)
-        model = gtk_grid_view_get_model(GTK_GRID_VIEW(list));
-    else if ((list = find_descendant(view, GTK_TYPE_COLUMN_VIEW)))
-        model = gtk_column_view_get_model(GTK_COLUMN_VIEW(list));
     if (!model)
         return paths;
     selection = gtk_selection_model_get_selection(model);
@@ -249,6 +259,55 @@ entry_name(const char *path)
     if (g_str_has_suffix(base, SUFFIX))
         base[strlen(base) - strlen(SUFFIX)] = '\0';
     return base;
+}
+
+/* path is a bundle directly in /Applications. GIO cannot trash that mount. */
+static gboolean
+in_shared(const char *path)
+{
+    char *resolved = real(path);
+    char *shared = shared_dir();
+    char *parent = NULL;
+    gboolean result = FALSE;
+
+    if (resolved && shared && is_bundle(resolved)) {
+        parent = g_path_get_dirname(resolved);
+        result = g_strcmp0(parent, shared) == 0;
+    }
+    g_free(parent);
+    g_free(resolved);
+    g_free(shared);
+    return result;
+}
+
+/* Asks the service. The directory stays until the person chooses Uninstall. */
+static gboolean
+ask_remove(const char *path, char **message)
+{
+    const char *argv[] = { ctl(), "remove", path, NULL };
+    char *err_out = NULL;
+    int status = 0;
+    GError *error = NULL;
+
+    if (!g_spawn_sync(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL, NULL,
+                      &err_out, &status, &error)) {
+        *message = g_strdup(error->message);
+        g_error_free(error);
+        return FALSE;
+    }
+    if (!g_spawn_check_wait_status(status, &error)) {
+        if (err_out && g_strstrip(err_out)[0] != '\0') {
+            *message = err_out;
+            g_clear_error(&error);
+        } else {
+            *message = g_strdup(error ? error->message : "The application could not be removed");
+            g_clear_error(&error);
+            g_free(err_out);
+        }
+        return FALSE;
+    }
+    g_free(err_out);
+    return TRUE;
 }
 
 static gboolean
@@ -343,6 +402,8 @@ typedef struct {
     GtkWidget *view;
 } Wrapped;
 
+static void unselect_shared(GtkWidget *view);
+
 static void
 on_wrapped_activate(GSimpleAction *action, GVariant *parameter, gpointer data)
 {
@@ -358,9 +419,11 @@ on_wrapped_activate(GSimpleAction *action, GVariant *parameter, gpointer data)
         g_free(resolved);
         if (busy) {
             char *name = entry_name(path);
-            g_message("elavo applications: %s is running; not moving it to the Trash", path);
+            gboolean shared = in_shared(path);
+            g_message("elavo applications: %s is running; not removing it", path);
             char *heading = g_strdup_printf("“%s” is open", name);
-            char *body = g_strdup_printf("Quit %s, then move it to the Trash.", name);
+            char *body = g_strdup_printf(shared ? "Quit %s, then delete it." : "Quit %s, then move it to the Trash.",
+                                         name);
             tell(wrapped->view, heading, body);
             g_free(body);
             g_free(heading);
@@ -369,8 +432,55 @@ on_wrapped_activate(GSimpleAction *action, GVariant *parameter, gpointer data)
             return;
         }
     }
+    gboolean any_shared = FALSE;
+    gboolean any_other = FALSE;
+    for (i = 0; i < paths->len; i++) {
+        const char *path = g_ptr_array_index(paths, i);
+        char *error = NULL;
+
+        if (!in_shared(path)) {
+            any_other = TRUE;
+            continue;
+        }
+        if (!ask_remove(path, &error)) {
+            tell(wrapped->view, "The application could not be removed", error);
+            g_free(error);
+            g_ptr_array_unref(paths);
+            return;
+        }
+        any_shared = TRUE;
+    }
     g_ptr_array_unref(paths);
-    g_action_activate(wrapped->original, parameter);
+    /* Nautilus would delete the shared entry itself. Drop it from the
+     * selection so the original action only sees the other files. */
+    if (any_shared && any_other)
+        unselect_shared(wrapped->view);
+    if (!any_shared || any_other)
+        g_action_activate(wrapped->original, parameter);
+}
+
+static void
+unselect_shared(GtkWidget *view)
+{
+    GtkSelectionModel *model = selection_model(view);
+    GtkBitset *selection;
+    GtkBitsetIter iter;
+    guint position;
+
+    if (!model)
+        return;
+    selection = gtk_selection_model_get_selection(model);
+    if (gtk_bitset_iter_init_first(&iter, selection, &position)) {
+        do {
+            GObject *item = g_list_model_get_item(G_LIST_MODEL(model), position);
+            char *path = item_path(item);
+            if (path && in_shared(path))
+                gtk_selection_model_unselect_item(model, position);
+            g_free(path);
+            g_clear_object(&item);
+        } while (gtk_bitset_iter_next(&iter, &position));
+    }
+    gtk_bitset_unref(selection);
 }
 
 static void

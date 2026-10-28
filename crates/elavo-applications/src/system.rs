@@ -102,8 +102,8 @@ fn install(folder: Folder, path: &Path) -> Result<(), String> {
     }
 }
 
-/// Root made this bundle; administrators must still be able to move it to
-/// the Trash, which renames the directory and needs write access to it.
+/// Root made this bundle; administrators must still be able to delete it.
+/// Removing the directory needs write access to it and to the folder.
 /// The setgid folder gives it the `wheel` group.
 fn open_to_admins(path: &Path) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2775));

@@ -1,7 +1,9 @@
 //! The account's service: installs what this account drops into an
 //! Applications folder, keeps `~/Applications` in step with the account's
-//! Flatpaks, asks Uninstall or Keep when an entry reaches the Trash, and
-//! gives every entry its icon in Files.
+//! Flatpaks, asks Uninstall or Keep, and gives every entry its icon in Files.
+//! The home folder asks when an entry reaches the Trash. `/Applications` is
+//! on a mount GIO will not trash, so Files and the dock ask before the entry
+//! is deleted.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -107,6 +109,8 @@ struct Service {
     busy: RefCell<HashSet<String>>,
     /// Files already reported as not installable.
     told: RefCell<HashSet<PathBuf>>,
+    /// Shared entries whose Uninstall question is already open.
+    asking: RefCell<HashSet<PathBuf>>,
     /// Dropped files being installed.
     handling: RefCell<HashSet<PathBuf>>,
     monitors: RefCell<Vec<gio::FileMonitor>>,
@@ -127,6 +131,7 @@ impl Service {
             expected_gone: RefCell::default(),
             busy: RefCell::default(),
             told: RefCell::default(),
+            asking: RefCell::default(),
             handling: RefCell::default(),
             monitors: RefCell::default(),
             bundle_monitors: RefCell::default(),
@@ -162,6 +167,18 @@ impl Service {
             );
         });
         app.add_action(&open);
+        // Files and the dock ask before a shared entry is deleted. GIO
+        // refuses to trash /var, so the entry stays put until Uninstall.
+        let confirm = gio::SimpleAction::new("confirm-remove", Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(&service);
+        confirm.connect_activate(move |_, param| {
+            let (Some(s), Some(path)) = (weak.upgrade(), param.and_then(|p| p.str())) else {
+                return;
+            };
+            let path = PathBuf::from(path);
+            glib::spawn_future_local(async move { s.confirm_remove(path).await });
+        });
+        app.add_action(&confirm);
         service
     }
 
@@ -340,7 +357,7 @@ impl Service {
         let gone = self.known.borrow_mut().remove(&path);
         if let Some(entry) = gone {
             self.bundle_monitors.borrow_mut().remove(&path);
-            if self.expected_gone.borrow_mut().remove(&path) {
+            if self.take_expected(&path) {
                 return;
             }
             let this = self.clone();
@@ -719,7 +736,7 @@ impl Service {
                 Folder::Home
             };
             let back = bundle::free_path(&other.dir(), &b.entry.name);
-            self.expected_gone.borrow_mut().insert(path.clone());
+            self.note_expected(&path);
             if std::fs::rename(&path, &back).is_ok() {
                 let where_ = if other == Folder::Shared {
                     "Applications, for every account"
@@ -732,7 +749,7 @@ impl Service {
                 );
                 return;
             }
-            self.expected_gone.borrow_mut().remove(&path);
+            self.forget_expected(&path);
         }
         self.known
             .borrow_mut()
@@ -824,7 +841,11 @@ impl Service {
         // a slow filesystem a moment.
         sleep(150).await;
         let Some(trashed) = trash::find(&path) else {
-            self.left_without_trash(folder, &path, &entry);
+            if folder == Folder::Shared {
+                self.shared_deleted(path, entry).await;
+            } else {
+                self.left_without_trash(folder, &path, &entry);
+            }
             return;
         };
         if is_running(&entry, &path, &trashed.file) {
@@ -895,8 +916,204 @@ impl Service {
         }
     }
 
-    /// Shift+Delete, `rm`, or a drag into another folder. A Flatpak is still
-    /// installed, so its entry comes back; only the Trash uninstalls.
+    /// Files or the dock asked before deleting a shared entry. The directory
+    /// is still in `/Applications`.
+    async fn confirm_remove(self: Rc<Self>, path: PathBuf) {
+        if Folder::of(&path) != Some(Folder::Shared) {
+            return;
+        }
+        let Some(bundle) = Bundle::read(&path) else {
+            return;
+        };
+        if bundle.entry.locked {
+            self.prompt.tell(
+                &format!("“{}” stays installed", bundle.entry.name),
+                "It is part of Elavo.",
+            );
+            return;
+        }
+        let key = paths::canonical(&path).unwrap_or_else(|| path.clone());
+        if !self.asking.borrow_mut().insert(key.clone()) {
+            return;
+        }
+        self.ask_shared(path, bundle.entry).await;
+        self.asking.borrow_mut().remove(&key);
+    }
+
+    /// `rm` or a delete that did not ask first. The entry is already gone.
+    /// Keep builds a Flatpak entry again. An AppImage's bytes went with it.
+    async fn shared_deleted(self: &Rc<Self>, path: PathBuf, entry: Entry) {
+        match entry.kind {
+            Kind::Flatpak => {
+                let key = paths::canonical(&path).unwrap_or_else(|| path.clone());
+                if !self.asking.borrow_mut().insert(key.clone()) {
+                    return;
+                }
+                self.ask_shared(path, entry).await;
+                self.asking.borrow_mut().remove(&key);
+            }
+            Kind::Appimage => {
+                let _ = bundle::sync_exports(Folder::Shared);
+                self.prompt.tell(
+                    &format!("“{}” left Applications", entry.name),
+                    &format!("{} is no longer in the Dock or Lens.", display_name(&path)),
+                );
+            }
+            Kind::System => {}
+        }
+    }
+
+    async fn ask_shared(self: &Rc<Self>, path: PathBuf, entry: Entry) {
+        if running::is_running(&entry, &path) {
+            self.prompt.tell(
+                &format!("“{}” is open", entry.name),
+                &format!("Quit {}, then delete it.", entry.name),
+            );
+            self.restore_flatpak(&entry);
+            return;
+        }
+        let (title, body) = shared_uninstall_copy(&entry);
+        let answer = self
+            .prompt
+            .ask(
+                &title,
+                &body,
+                &[("Keep", Style::Plain), ("Uninstall", Style::Destructive)],
+            )
+            .await;
+        if answer != Some(1) {
+            self.restore_flatpak(&entry);
+            return;
+        }
+        if running::is_running(&entry, &path) {
+            self.prompt.tell(
+                &format!("“{}” is open", entry.name),
+                &format!("Quit {}, then delete it.", entry.name),
+            );
+            self.restore_flatpak(&entry);
+            return;
+        }
+        self.uninstall_shared(&path, &entry).await;
+    }
+
+    async fn uninstall_shared(self: &Rc<Self>, path: &Path, entry: &Entry) {
+        // Mark the directories first. Uninstalling makes the root service
+        // delete the entry, and that must not ask a second time.
+        let copies = self.shared_copies(path, entry);
+        for dir in &copies {
+            self.note_expected(dir);
+        }
+        if entry.kind == Kind::Flatpak {
+            if !self.busy.borrow_mut().insert(entry.id.clone()) {
+                for dir in &copies {
+                    self.forget_expected(dir);
+                }
+                return;
+            }
+            let (id, scope) = (entry.id.clone(), entry.scope);
+            let result = blocking(move || flatpak::uninstall(&id, scope)).await;
+            self.busy.borrow_mut().remove(&entry.id);
+            if let Err(e) = result {
+                for dir in &copies {
+                    self.forget_expected(dir);
+                }
+                self.prompt
+                    .tell(&format!("{} could not be uninstalled", entry.name), &e);
+                self.restore_flatpak(entry);
+                return;
+            }
+        }
+        let mut failed = None;
+        for dir in &copies {
+            if std::fs::symlink_metadata(dir).is_err() {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                self.forget_expected(dir);
+                failed = Some(e.to_string());
+            }
+        }
+        let _ = bundle::sync_exports(Folder::Shared);
+        if let Some(e) = failed {
+            self.prompt
+                .tell(&format!("{} could not be removed", entry.name), &e);
+        }
+    }
+
+    /// The entry that was asked about, plus one the root service may have
+    /// written back while the question was open.
+    fn shared_copies(&self, path: &Path, entry: &Entry) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if std::fs::symlink_metadata(path).is_ok() {
+            dirs.push(path.to_path_buf());
+        }
+        if let Some(found) = bundle::find(&Folder::Shared.dir(), entry.kind, &entry.id) {
+            if !dirs.iter().any(|d| same_path(d, &found.path)) {
+                dirs.push(found.path);
+            }
+        }
+        dirs
+    }
+
+    /// A Flatpak entry that was deleted before Uninstall. Nothing to do when
+    /// it is already back, or when the Flatpak itself is gone.
+    fn restore_flatpak(self: &Rc<Self>, entry: &Entry) {
+        if entry.kind != Kind::Flatpak {
+            return;
+        }
+        let dir = Folder::Shared.dir();
+        if bundle::find(&dir, Kind::Flatpak, &entry.id).is_some() {
+            return;
+        }
+        let Some(installed) = flatpak::list(entry.scope) else {
+            self.prompt.tell(
+                "The application could not be put back",
+                "flatpak could not list applications",
+            );
+            return;
+        };
+        let Some(app) = installed.into_iter().find(|a| a.id == entry.id) else {
+            return;
+        };
+        match bundle::create_flatpak(&dir, &app, entry.scope) {
+            Ok(b) => self.after_install(Folder::Shared, &b),
+            Err(e) => self
+                .prompt
+                .tell("The application could not be put back", &e),
+        }
+    }
+
+    fn note_expected(&self, path: &Path) {
+        let mut set = self.expected_gone.borrow_mut();
+        set.insert(path.to_path_buf());
+        if let Some(real) = paths::canonical(path) {
+            set.insert(real);
+        }
+    }
+
+    fn forget_expected(&self, path: &Path) {
+        let mut set = self.expected_gone.borrow_mut();
+        if let Some(real) = paths::canonical(path) {
+            set.remove(&real);
+        }
+        set.remove(path);
+    }
+
+    fn take_expected(&self, path: &Path) -> bool {
+        let real = paths::canonical(path);
+        let mut set = self.expected_gone.borrow_mut();
+        let hit = set.contains(path) || real.as_ref().is_some_and(|p| set.contains(p));
+        set.remove(path);
+        if let Some(p) = real {
+            set.remove(&p);
+        }
+        hit
+    }
+
+    /// Shift+Delete, `rm`, or a drag into another folder, in the home
+    /// folder. A Flatpak is still installed, so its entry comes back; only
+    /// the Trash uninstalls. The shared folder asks instead, because GIO
+    /// will not trash `/var`.
     fn left_without_trash(self: &Rc<Self>, folder: Folder, path: &Path, entry: &Entry) {
         match entry.kind {
             Kind::Flatpak => {
@@ -1111,6 +1328,23 @@ fn read_updates(mut from: impl std::io::Read, mut line: impl FnMut(String)) {
     if !pending.is_empty() {
         line(String::from_utf8_lossy(&pending).into_owned());
     }
+}
+
+fn shared_uninstall_copy(entry: &Entry) -> (String, String) {
+    let title = format!("Uninstall “{}”?", entry.name);
+    let body = match entry.kind {
+        Kind::Flatpak => "Uninstalling removes the application. It is removed for every account on this computer. Its settings and data are kept, so installing it again later picks up where you left off.",
+        _ => "Uninstalling removes it from the Dock and Lens. It is removed for every account on this computer. The file is deleted.",
+    };
+    (title, body.to_owned())
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (paths::canonical(a), paths::canonical(b)),
+            (Some(a), Some(b)) if a == b
+        )
 }
 
 fn is_running(entry: &Entry, original: &Path, trashed: &Path) -> bool {

@@ -4,7 +4,7 @@
 //! ```text
 //! elavo-applications-ctl launch <desktop-id>
 //! elavo-applications-ctl install <file> [--shared]
-//! elavo-applications-ctl remove <bundle>
+//! elavo-applications-ctl remove <bundle>   Trash at home; ask in /Applications
 //! elavo-applications-ctl running <bundle>      exit 0 when it is running
 //! elavo-applications-ctl shortcut <bundle> <directory>
 //! elavo-applications-ctl list
@@ -80,26 +80,24 @@ fn launch(id: &str) -> Result<(), String> {
         }
     };
     let Some(info) = info else {
-        tell_service("missing", id);
+        let _ = tell_service("missing", id);
         return Err(format!("{id} is not installed"));
     };
     let context = gio::AppLaunchContext::new();
     info.launch(&[], Some(&context)).map_err(|e| e.to_string())
 }
 
-/// Asks the running user service to show something. Nothing happens when
-/// it is not running.
-fn tell_service(action: &str, value: &str) {
-    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
-        return;
-    };
+/// Asks the running user service to show something.
+fn tell_service(action: &str, value: &str) -> Result<(), String> {
+    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .map_err(|e| e.to_string())?;
     let params = (
         action,
         vec![value.to_variant()],
         std::collections::HashMap::<String, glib::Variant>::new(),
     )
         .to_variant();
-    let _ = bus.call_sync(
+    bus.call_sync(
         Some("io.elavo.Applications"),
         "/io/elavo/Applications",
         "org.freedesktop.Application",
@@ -109,7 +107,9 @@ fn tell_service(action: &str, value: &str) {
         gio::DBusCallFlags::NONE,
         5000,
         gio::Cancellable::NONE,
-    );
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Applications is not running ({e})"))
 }
 
 fn install(file: &Path, shared: bool) -> Result<(), String> {
@@ -117,10 +117,21 @@ fn install(file: &Path, shared: bool) -> Result<(), String> {
     elavo_applications_core::place::place(file, folder)
 }
 
-/// The same gesture as dragging the bundle to the Trash.
+/// Home entries go to the Trash. Shared entries cannot: GIO refuses to
+/// trash `/var`, so the service asks Uninstall or Keep and the directory
+/// stays until Uninstall.
 fn remove(path: &Path) -> Result<(), String> {
-    if Bundle::read(path).is_none() {
+    let Some(bundle) = Bundle::read(path) else {
         return Err(format!("{} is not an application", path.display()));
+    };
+    if bundle.entry.locked {
+        return Err(format!(
+            "{} is part of Elavo and stays installed",
+            bundle.entry.name
+        ));
+    }
+    if Folder::of(path) == Some(Folder::Shared) {
+        return tell_service("confirm-remove", &path.to_string_lossy());
     }
     gio::File::for_path(path)
         .trash(gio::Cancellable::NONE)
