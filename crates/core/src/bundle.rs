@@ -122,6 +122,96 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+const GTK_VERSION_FLAG: &str = "--gtk-version=4";
+
+/// Brave, Chrome, Chromium, Edge, Opera, and Vivaldi, including channel
+/// builds and the AppImage stem (`brave-origin`). Not Firefox, and not
+/// Electron: Cursor's id does not match.
+fn wants_gtk_version(id: &str) -> bool {
+    let id = id.strip_suffix(".desktop").unwrap_or(id);
+    let lower = id.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "com.google.chrome",
+        "com.brave.browser",
+        "com.brave.origin",
+        "org.chromium.chromium",
+        "com.microsoft.edge",
+        "com.vivaldi.vivaldi",
+        "com.opera.opera",
+        "io.github.ungoogled_software.ungoogled_chromium",
+        "google-chrome",
+        "chromium-browser",
+        "chromium",
+        "brave-browser",
+        "brave-origin",
+        "microsoft-edge",
+        "vivaldi",
+        "opera",
+    ];
+    lower == "brave"
+        || PREFIXES
+            .iter()
+            .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix}.")))
+        || PREFIXES.iter().any(|prefix| {
+            lower
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
+}
+
+/// Puts [`GTK_VERSION_FLAG`] on an `Exec` line. A line that already chooses
+/// a GTK version is left alone.
+fn with_gtk_version(exec: &str) -> String {
+    if exec
+        .split_whitespace()
+        .any(|arg| arg == GTK_VERSION_FLAG || arg.starts_with("--gtk-version="))
+    {
+        return exec.to_owned();
+    }
+    let (prog, args) = split_exec(exec);
+    let base = Path::new(&prog)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(prog.as_str());
+    if base == "flatpak" {
+        return insert_after_flatpak_id(exec);
+    }
+    // gtk-launch does not forward arguments to the application.
+    if base == "gtk-launch" {
+        return exec.to_owned();
+    }
+    let prog = if exec.trim_start().starts_with('"') {
+        exec_arg(&prog)
+    } else {
+        prog
+    };
+    if args.is_empty() {
+        format!("{prog} {GTK_VERSION_FLAG}")
+    } else {
+        format!("{prog} {GTK_VERSION_FLAG} {args}")
+    }
+}
+
+/// `flatpak run [options] <id> [app args]`. The flag belongs to the app.
+fn insert_after_flatpak_id(exec: &str) -> String {
+    let tokens: Vec<&str> = exec.split_whitespace().collect();
+    let Some(run_at) = tokens.iter().position(|token| *token == "run") else {
+        return exec.to_owned();
+    };
+    let Some(id_at) = tokens
+        .iter()
+        .enumerate()
+        .skip(run_at + 1)
+        .find(|(_, token)| !token.starts_with('-'))
+        .map(|(index, _)| index)
+    else {
+        return exec.to_owned();
+    };
+    let mut tokens = tokens;
+    tokens.insert(id_at + 1, GTK_VERSION_FLAG);
+    tokens.join(" ")
+}
+
 /// `launch.desktop` for a bundle at `path`.
 pub fn launch_desktop(path: &Path, entry: &Entry) -> KeyFile {
     let mut file = match entry.kind {
@@ -171,6 +261,18 @@ pub fn launch_desktop(path: &Path, entry: &Entry) -> KeyFile {
     main.set("X-Elavo-Bundle", &path.to_string_lossy());
     main.remove("Hidden");
     main.remove("NoDisplay");
+    // Chromium paints its own window unless told to load GTK. Elavo's theme
+    // is GTK 4; GTK 3 is only the stopgap. The flag has to follow a Flatpak
+    // id, or `flatpak run` treats it as its own option. Firefox is a GTK
+    // application and has no such switch. Electron apps are Chromium too,
+    // and they do not accept it.
+    if wants_gtk_version(&entry.id) {
+        for (_, group) in file.groups.iter_mut() {
+            if let Some(exec) = group.get("Exec").map(str::to_owned) {
+                group.set("Exec", &with_gtk_version(&exec));
+            }
+        }
+    }
     file
 }
 
@@ -480,5 +582,36 @@ mod tests {
         );
         assert!(run_script("it's.AppImage").contains("exec ./'it'\\''s.AppImage' \"$@\""));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn chromium_launchers_ask_for_gtk4_and_firefox_does_not() {
+        assert!(wants_gtk_version("com.google.Chrome"));
+        assert!(wants_gtk_version("com.brave.Browser"));
+        assert!(wants_gtk_version("brave-origin"));
+        assert!(wants_gtk_version("google-chrome-unstable"));
+        assert!(wants_gtk_version("com.microsoft.Edge"));
+        assert!(!wants_gtk_version("org.mozilla.firefox"));
+        assert!(!wants_gtk_version("cursor"));
+
+        let chrome = "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=/app/bin/chrome --file-forwarding com.google.Chrome @@u %U @@";
+        assert_eq!(
+            with_gtk_version(chrome),
+            "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=/app/bin/chrome --file-forwarding com.google.Chrome --gtk-version=4 @@u %U @@"
+        );
+        assert_eq!(
+            with_gtk_version("flatpak run --command=brave com.brave.Browser --incognito"),
+            "flatpak run --command=brave com.brave.Browser --gtk-version=4 --incognito"
+        );
+        assert_eq!(
+            with_gtk_version("\"/Applications/Brave Origin.eapp/run\" %U"),
+            "\"/Applications/Brave Origin.eapp/run\" --gtk-version=4 %U"
+        );
+        let chosen = "google-chrome --gtk-version=3 %U";
+        assert_eq!(with_gtk_version(chosen), chosen);
+        assert_eq!(
+            with_gtk_version("gtk-launch com.google.Chrome"),
+            "gtk-launch com.google.Chrome"
+        );
     }
 }
