@@ -4,6 +4,9 @@ Description=Watch the shared Applications folder and the system Flatpaks
 [Path]
 PathChanged=/var/Applications
 PathChanged=/var/lib/flatpak/app
+# Flatpak touches this once a deploy or an uninstall is complete. The app
+# directory changes earlier, while `flatpak list` does not show the app yet.
+PathChanged=/var/lib/flatpak/.changed
 Unit=elavo-applications-system.service
 
 [Install]

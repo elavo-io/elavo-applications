@@ -296,18 +296,29 @@ impl Service {
     fn watch_flatpaks(self: &Rc<Self>) {
         let dir = flatpak::app_dir(elavo_applications_core::Scope::User);
         let _ = std::fs::create_dir_all(&dir);
-        let Ok(monitor) = gio::File::for_path(dir)
+        if let Ok(monitor) = gio::File::for_path(dir)
             .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-        else {
-            return;
-        };
-        let weak = Rc::downgrade(self);
-        monitor.connect_changed(move |_, _, _, _| {
-            if let Some(s) = weak.upgrade() {
-                s.queue_mirror();
-            }
-        });
-        self.monitors.borrow_mut().push(monitor);
+        {
+            let weak = Rc::downgrade(self);
+            monitor.connect_changed(move |_, _, _, _| {
+                if let Some(s) = weak.upgrade() {
+                    s.queue_mirror();
+                }
+            });
+            self.monitors.borrow_mut().push(monitor);
+        }
+        let changed = flatpak::changed_file(elavo_applications_core::Scope::User);
+        if let Ok(monitor) = gio::File::for_path(changed)
+            .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        {
+            let weak = Rc::downgrade(self);
+            monitor.connect_changed(move |_, _, _, _| {
+                if let Some(s) = weak.upgrade() {
+                    s.queue_mirror();
+                }
+            });
+            self.monitors.borrow_mut().push(monitor);
+        }
     }
 
     fn queue(self: &Rc<Self>, path: PathBuf) {

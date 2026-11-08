@@ -287,6 +287,13 @@ pub fn app_dir(scope: Scope) -> PathBuf {
     installation(scope).join("app")
 }
 
+/// Flatpak touches this file once a deploy or an uninstall is complete.
+/// `app/<id>` appears before the deploy finishes, so a pass that `app_dir`
+/// wakes can run while `flatpak list` does not show the app yet.
+pub fn changed_file(scope: Scope) -> PathBuf {
+    installation(scope).join(".changed")
+}
+
 pub fn exported_desktop(id: &str, scope: Scope) -> PathBuf {
     installation(scope)
         .join("exports/share/applications")
