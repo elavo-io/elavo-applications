@@ -7,7 +7,8 @@
  *   back. A copy that lives outside the Applications folders is opened with
  *   elavo-applications-ctl open: a Flatpak whose app is gone is copied back
  *   in and installed, and the original copy stays. Opening an entry in a
- *   new tab or window shows its contents.
+ *   new tab or window shows its contents. Right-click Show Contents opens the
+ *   folder in this window and does not start the application.
  * - A copied bundle keeps the icon file inside it. Files' stored icon is a
  *   path, and that path dies when the original entry is uninstalled, so the
  *   module points the copy at its own icon.
@@ -53,6 +54,8 @@
 #define WATCHED "elavo-applications-watched"
 #define PREVIOUS "elavo-applications-previous"
 #define BLOCKED "elavo-applications-blocked"
+#define SHOW_CONTENTS "elavo-applications-show-contents"
+#define CONTENTS_MARK "elavo-show-contents"
 #define PASSING "elavo-applications-passing"
 
 typedef GFile *(*FileInfoGetLocation)(gpointer file);
@@ -407,12 +410,16 @@ on_location(GObject *object, GParamSpec *pspec, gpointer data)
 
     (void)pspec;
     (void)data;
-    if (resolved && is_bundle(resolved) && previous && g_strcmp0(previous, parent) == 0) {
+    /* Show Contents sets this so the folder stays open. A double-click does not. */
+    if (resolved && is_bundle(resolved) && g_strcmp0(g_object_get_data(object, SHOW_CONTENTS), resolved) == 0)
+        g_object_set_data(object, SHOW_CONTENTS, NULL);
+    else if (resolved && is_bundle(resolved) && previous && g_strcmp0(previous, parent) == 0) {
         Opened *opened = g_new0(Opened, 1);
         opened->slot = g_object_ref(slot);
         opened->bundle = g_strdup(resolved);
         g_idle_add(launch_and_return, opened);
-    }
+    } else if (g_object_get_data(object, SHOW_CONTENTS))
+        g_object_set_data(object, SHOW_CONTENTS, NULL);
     g_object_set_data_full(object, PREVIOUS, g_strdup(path), g_free);
     g_free(parent);
     g_free(resolved);
@@ -641,10 +648,190 @@ wrap_action(GActionMap *map, const char *name, GtkWidget *view)
     g_object_unref(wrapper);
 }
 
+/* The one selected bundle, or NULL when the selection is anything else. */
+static char *
+single_bundle(GtkWidget *view)
+{
+    GPtrArray *paths = selected_paths(view);
+    char *bundle = NULL;
+
+    if (paths->len == 1) {
+        char *resolved = real(g_ptr_array_index(paths, 0));
+
+        if (resolved && is_bundle(resolved))
+            bundle = resolved;
+        else
+            g_free(resolved);
+    }
+    g_ptr_array_unref(paths);
+    return bundle;
+}
+
+static void
+on_show_contents(GSimpleAction *action, GVariant *parameter, gpointer data)
+{
+    GtkWidget *view = data;
+    GtkWidget *slot = ancestor(view, slot_type);
+    char *bundle = single_bundle(view);
+    char *uri;
+
+    (void)action;
+    (void)parameter;
+    if (!slot || !bundle) {
+        g_free(bundle);
+        return;
+    }
+    uri = g_filename_to_uri(bundle, NULL, NULL);
+    g_object_set_data_full(G_OBJECT(slot), SHOW_CONTENTS, bundle, g_free);
+    if (!uri || !gtk_widget_activate_action(slot, "slot.open-location", "s", uri))
+        g_object_set_data(G_OBJECT(slot), SHOW_CONTENTS, NULL);
+    g_free(uri);
+}
+
+static gboolean
+model_has_action(GMenuModel *model, const char *action)
+{
+    int i;
+    int n = g_menu_model_get_n_items(model);
+
+    for (i = 0; i < n; i++) {
+        char *value = NULL;
+        GMenuModel *section = g_menu_model_get_item_link(model, i, G_MENU_LINK_SECTION);
+        GMenuModel *submenu = g_menu_model_get_item_link(model, i, G_MENU_LINK_SUBMENU);
+        gboolean found = FALSE;
+
+        if (g_menu_model_get_item_attribute(model, i, "action", "s", &value) && g_strcmp0(value, action) == 0)
+            found = TRUE;
+        g_free(value);
+        if (!found && section)
+            found = model_has_action(section, action);
+        if (!found && submenu)
+            found = model_has_action(submenu, action);
+        g_clear_object(&section);
+        g_clear_object(&submenu);
+        if (found)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean
+is_contents_section(GMenuModel *model, int index)
+{
+    char *mark = NULL;
+    gboolean ours;
+
+    ours = g_menu_model_get_item_attribute(model, index, "elavo", "s", &mark) && g_strcmp0(mark, CONTENTS_MARK) == 0;
+    g_free(mark);
+    return ours;
+}
+
+/* The top-level section that contains `action`, or -1. */
+static int
+section_with_action(GMenuModel *menu, const char *action)
+{
+    int i;
+    int n = g_menu_model_get_n_items(menu);
+
+    for (i = 0; i < n; i++) {
+        GMenuModel *section = g_menu_model_get_item_link(menu, i, G_MENU_LINK_SECTION);
+        gboolean found = section && model_has_action(section, action);
+
+        g_clear_object(&section);
+        if (found)
+            return i;
+    }
+    return -1;
+}
+
+/* Nautilus keeps the selection menu on the view. GTK has no getter for it, so
+ * the field is found the same way as the view's actions. */
+static GMenu *
+selection_menu(GObject *view)
+{
+    static gsize offset;
+    GArray *maps;
+    gsize at;
+    GMenu *found = NULL;
+
+    if (offset) {
+        gpointer candidate = *(gpointer *)((char *)view + offset);
+
+        if (G_IS_MENU(candidate) && model_has_action(G_MENU_MODEL(candidate), "view.cut") &&
+            model_has_action(G_MENU_MODEL(candidate), "view.open-item-new-tab"))
+            return G_MENU(candidate);
+        offset = 0;
+    }
+    maps = load_maps();
+    for (at = sizeof(gpointer); at < 8192; at += sizeof(gpointer)) {
+        gpointer candidate;
+        GTypeClass *klass;
+
+        if (!readable(maps, (char *)view + at, sizeof(gpointer)))
+            break;
+        candidate = *(gpointer *)((char *)view + at);
+        if (!candidate || ((guintptr)candidate & (sizeof(gpointer) - 1)) != 0)
+            continue;
+        if (!readable(maps, candidate, sizeof(gpointer)))
+            continue;
+        klass = *(GTypeClass **)candidate;
+        if (!readable(maps, klass, sizeof(GTypeClass)))
+            continue;
+        if (klass->g_type == 0 || g_type_name(klass->g_type) == NULL)
+            continue;
+        if (!G_IS_MENU(candidate))
+            continue;
+        if (!model_has_action(G_MENU_MODEL(candidate), "view.cut") ||
+            !model_has_action(G_MENU_MODEL(candidate), "view.open-item-new-tab"))
+            continue;
+        offset = at;
+        found = G_MENU(candidate);
+        break;
+    }
+    g_array_unref(maps);
+    return found;
+}
+
+/* One section of our own, after Open and before Cut. Nothing else in the menu
+ * is added, removed, or rebuilt: the other rows keep the icons Nautilus gave
+ * them. This runs when the popover is parented, before it reads the model. */
+static void
+place_show_contents(GtkWidget *view)
+{
+    GMenu *menu = selection_menu(G_OBJECT(view));
+    char *bundle;
+    int cut;
+    int i;
+    GMenu *section;
+    GMenuItem *holder;
+
+    if (!menu)
+        return;
+    for (i = g_menu_model_get_n_items(G_MENU_MODEL(menu)) - 1; i >= 0; i--) {
+        if (is_contents_section(G_MENU_MODEL(menu), i))
+            g_menu_remove(menu, i);
+    }
+    bundle = single_bundle(view);
+    if (!bundle)
+        return;
+    g_free(bundle);
+    cut = section_with_action(G_MENU_MODEL(menu), "view.cut");
+    if (cut < 0)
+        return;
+    section = g_menu_new();
+    g_menu_append(section, "Show Contents", "view.show-contents");
+    holder = g_menu_item_new_section(NULL, G_MENU_MODEL(section));
+    g_menu_item_set_attribute(holder, "elavo", "s", CONTENTS_MARK);
+    g_menu_insert_item(menu, cut, holder);
+    g_object_unref(holder);
+    g_object_unref(section);
+}
+
 static void
 watch_view(GtkWidget *view)
 {
     GActionMap *map;
+    GSimpleAction *show_contents;
 
     if (g_object_get_data(G_OBJECT(view), WATCHED))
         return;
@@ -654,6 +841,10 @@ watch_view(GtkWidget *view)
         g_warning("elavo applications: no view actions found");
         return;
     }
+    show_contents = g_simple_action_new("show-contents", NULL);
+    g_signal_connect(show_contents, "activate", G_CALLBACK(on_show_contents), view);
+    g_action_map_add_action(map, G_ACTION(show_contents));
+    g_object_unref(show_contents);
     /* Nautilus 50's names. /Applications cannot be trashed, so there Nautilus
      * offers only the permanent deletes. */
     wrap_action(map, "move-to-trash", view);
@@ -1055,8 +1246,9 @@ icon_inside(const char *uri, const char *bundle)
     return ok;
 }
 
-/* Files stores a folder icon as a path. A copy does not get the original's
- * metadata, and the original path is gone once that entry is uninstalled. */
+/* Files stores a folder icon as a path. A copy outside the Applications
+ * folders does not get the service's metadata, and the original path is gone
+ * once that entry is uninstalled. */
 static void
 ensure_bundle_icon(const char *bundle)
 {
@@ -1124,7 +1316,9 @@ on_map_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpointer
     else if (view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) {
         char *path = cell_path(widget);
         char *resolved = real(path);
-        if (resolved && is_bundle(resolved))
+        /* Copies only. An entry in the Applications folders keeps the icon
+         * the service set, including an Elavo theme icon. */
+        if (resolved && is_bundle(resolved) && !in_applications(resolved))
             ensure_bundle_icon(resolved);
         g_free(resolved);
         g_free(path);
@@ -1134,9 +1328,31 @@ on_map_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpointer
     return TRUE;
 }
 
+static void (*popover_root_original)(GtkWidget *widget);
+
+/* Runs while the menu popover is being parented, before Nautilus gives it the
+ * menu. The rows, and their icons, are built once from the finished model. */
+static void
+popover_root(GtkWidget *widget)
+{
+    GtkWidget *parent;
+
+    if (popover_root_original)
+        popover_root_original(widget);
+    if (!GTK_IS_POPOVER_MENU(widget) || gtk_popover_menu_get_menu_model(GTK_POPOVER_MENU(widget)))
+        return;
+    if (!files_view_type)
+        files_view_type = g_type_from_name("NautilusFilesView");
+    parent = gtk_widget_get_parent(widget);
+    if (parent && files_view_type && g_type_check_instance_is_a((GTypeInstance *)parent, files_view_type))
+        place_show_contents(parent);
+}
+
 static void
 start(void)
 {
+    GtkWidgetClass *popover;
+
     if (started)
         return;
     started = TRUE;
@@ -1144,6 +1360,11 @@ start(void)
     /* Signals exist once their class is initialized. */
     g_type_class_ref(GTK_TYPE_WIDGET);
     g_type_class_ref(GTK_TYPE_DRAG_SOURCE);
+    popover = GTK_WIDGET_CLASS(g_type_class_ref(GTK_TYPE_POPOVER_MENU));
+    if (popover->root != popover_root) {
+        popover_root_original = popover->root;
+        popover->root = popover_root;
+    }
     g_signal_add_emission_hook(g_signal_lookup("map", GTK_TYPE_WIDGET), 0, on_map_hook, NULL, NULL);
     g_signal_add_emission_hook(g_signal_lookup("prepare", GTK_TYPE_DRAG_SOURCE), 0, on_prepare_hook, NULL, NULL);
     g_signal_add_emission_hook(g_signal_lookup("drag-end", GTK_TYPE_DRAG_SOURCE), 0, on_drag_end_hook, NULL, NULL);
