@@ -64,6 +64,11 @@ pub fn writable(dir: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
+/// Ids of user Flatpaks this account has had installed.
+pub fn user_seen_flatpaks() -> PathBuf {
+    state_home().join("elavo-applications/seen-flatpaks")
+}
+
 /// Where the root service remembers which system Flatpaks it has seen.
 pub fn system_state() -> PathBuf {
     std::env::var_os("ELAVO_APPLICATIONS_STATE")

@@ -227,11 +227,155 @@ pub fn display_name(id: &str) -> String {
 
 /// The application id a `.flatpakref` names.
 pub fn ref_name(file: &Path) -> Option<String> {
-    let key = KeyFile::read(file)?;
+    ref_name_in(&std::fs::read(file).ok()?)
+}
+
+pub fn ref_name_in(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let key = KeyFile::parse(text);
     key.group("Flatpak Ref")?
         .get("Name")
         .map(str::to_owned)
         .filter(|n| !n.is_empty())
+}
+
+/// `url` for `[remote "name"]` in an ostree `repo/config`.
+pub fn remote_url(config: &str, remote: &str) -> Option<String> {
+    let file = KeyFile::parse(config);
+    let url = file.group(&format!("remote \"{remote}\""))?.get("url")?;
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_owned())
+    }
+}
+
+/// `x86_64/stable` → `stable`. The `current` symlink of a deployed app.
+pub fn branch_from_target(target: &str) -> Option<String> {
+    let branch = target.trim().rsplit('/').next().unwrap_or("").trim();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_owned())
+    }
+}
+
+/// The branch this installation deployed, or `stable` when it has no `current` link.
+pub fn deploy_branch(scope: Scope, id: &str) -> String {
+    let current = app_dir(scope).join(id).join("current");
+    std::fs::read_link(current)
+        .ok()
+        .as_deref()
+        .and_then(|p| branch_from_target(&p.to_string_lossy()))
+        .unwrap_or_else(|| "stable".to_owned())
+}
+
+/// Whether `id` is deployed: Flatpak leaves `app/<id>/current` while it is.
+pub fn deployed(scope: Scope, id: &str) -> bool {
+    std::fs::symlink_metadata(app_dir(scope).join(id).join("current")).is_ok()
+}
+
+fn remote_key_file(scope: Scope, origin: &str) -> Option<PathBuf> {
+    if origin.is_empty()
+        || origin.contains('/')
+        || origin.contains('\\')
+        || origin.contains('\0')
+        || origin == "."
+        || origin == ".."
+    {
+        return None;
+    }
+    Some(
+        installation(scope)
+            .join("repo")
+            .join(format!("{origin}.trustedkeys.gpg")),
+    )
+}
+
+/// Base64 of the remote's trusted key, for a generated `.flatpakref`.
+pub fn gpg_key(scope: Scope, origin: &str) -> Option<String> {
+    let bytes = std::fs::read(remote_key_file(scope, origin)?).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(encode_base64(&bytes))
+    }
+}
+
+/// A `.flatpakref` for an app that is already installed, from that
+/// installation's remote. None when the remote has no URL, so the caller
+/// leaves the bundle without a reference instead of writing a useless one.
+pub fn portable_ref(app: &Installed, scope: Scope) -> Option<String> {
+    if app.id.is_empty() || app.origin.is_empty() || !deployed(scope, &app.id) {
+        return None;
+    }
+    let config = std::fs::read_to_string(installation(scope).join("repo/config")).ok()?;
+    let url = remote_url(&config, &app.origin)?;
+    let branch = deploy_branch(scope, &app.id);
+    let gpg = gpg_key(scope, &app.origin);
+    Some(render_ref(
+        &app.id,
+        &app.name,
+        &branch,
+        &url,
+        &app.origin,
+        gpg.as_deref(),
+    ))
+}
+
+/// Text of a `.flatpakref`. `gpg_key` is already base64. No `RuntimeRepo`:
+/// a generated ref expects the runtime in `url`, which is true for Flathub.
+/// A dropped ref is kept as the publisher wrote it, including `RuntimeRepo`.
+pub fn render_ref(
+    id: &str,
+    title: &str,
+    branch: &str,
+    url: &str,
+    remote: &str,
+    gpg_key: Option<&str>,
+) -> String {
+    let title: String = title
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let mut out = format!(
+        "[Flatpak Ref]\nName={id}\nBranch={branch}\nTitle={title}\nUrl={url}\nSuggestRemoteName={remote}\nIsRuntime=false\n"
+    );
+    if let Some(key) = gpg_key.filter(|k| !k.is_empty()) {
+        out.push_str("GPGKey=");
+        out.push_str(key);
+        out.push('\n');
+    }
+    out
+}
+
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        i += 3;
+    }
+    let rest = bytes.len() - i;
+    if rest == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 /// The application id inside a `.flatpak` bundle, such as `com.rtsoft.patchy`.
@@ -371,7 +515,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ref_host(&file).as_deref(), Some("dl.flathub.org"));
+        assert_eq!(
+            ref_name_in(b"[Flatpak Ref]\nName=org.gnome.Calculator\n"),
+            Some("org.gnome.Calculator".into())
+        );
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_generated_ref_names_the_remote() {
+        let text = render_ref(
+            "org.mozilla.firefox",
+            "Fire\nfox",
+            "stable",
+            "https://dl.flathub.org/repo/",
+            "flathub",
+            Some("aGVsbG8="),
+        );
+        assert!(text.starts_with("[Flatpak Ref]\n"));
+        assert!(text.contains("Name=org.mozilla.firefox\n"));
+        assert!(text.contains("Branch=stable\n"));
+        assert!(text.contains("Title=Fire fox\n"));
+        assert!(text.contains("Url=https://dl.flathub.org/repo/\n"));
+        assert!(text.contains("SuggestRemoteName=flathub\n"));
+        assert!(text.contains("IsRuntime=false\n"));
+        assert!(text.contains("GPGKey=aGVsbG8=\n"));
+        assert!(!text.contains("RuntimeRepo"));
+        assert_eq!(
+            ref_name_in(text.as_bytes()).as_deref(),
+            Some("org.mozilla.firefox")
+        );
+
+        let config =
+            "[core]\nrepo_version=1\n\n[remote \"flathub\"]\nurl=https://dl.flathub.org/repo/\n";
+        assert_eq!(
+            remote_url(config, "flathub").as_deref(),
+            Some("https://dl.flathub.org/repo/")
+        );
+        assert_eq!(remote_url(config, "missing"), None);
+        assert_eq!(
+            branch_from_target("x86_64/stable").as_deref(),
+            Some("stable")
+        );
+        assert_eq!(branch_from_target("stable").as_deref(), Some("stable"));
+        assert_eq!(branch_from_target("  "), None);
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(encode_base64(b"hi"), "aGk=");
+        assert_eq!(encode_base64(&[0xff]), "/w==");
     }
 
     #[test]

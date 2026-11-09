@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! elavo-applications-ctl launch <desktop-id>
+//! elavo-applications-ctl open <bundle>
 //! elavo-applications-ctl install <file> [--shared]
 //! elavo-applications-ctl remove <bundle>   Trash at home; ask in /Applications
 //! elavo-applications-ctl running <bundle>      exit 0 when it is running
@@ -14,17 +15,18 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use elavo_applications_core::{bundle, running, Bundle, Folder};
+use elavo_applications_core::{bundle, flatpak, running, Bundle, Folder, Kind, Scope};
 use gio::glib;
 use gio::prelude::*;
 
-const USAGE: &str = "usage: elavo-applications-ctl launch <id> | install <file> [--shared] | remove <bundle> | running <bundle> | shortcut <bundle> <dir> | list | inspect <appimage>";
+const USAGE: &str = "usage: elavo-applications-ctl launch <id> | open <bundle> | install <file> [--shared] | remove <bundle> | running <bundle> | shortcut <bundle> <dir> | list | inspect <appimage>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["launch", id] => launch(id),
+        ["open", file] => open_bundle(Path::new(file)),
         ["install", file] => install(Path::new(file), false),
         ["install", file, "--shared"] | ["install", "--shared", file] => {
             install(Path::new(file), true)
@@ -85,6 +87,54 @@ fn launch(id: &str) -> Result<(), String> {
     };
     let context = gio::AppLaunchContext::new();
     info.launch(&[], Some(&context)).map_err(|e| e.to_string())
+}
+
+/// Opens a bundle that lives outside the Applications folders. A Flatpak
+/// copy whose app is gone is copied back in, and the service installs it.
+/// The original copy stays. Anything that can already run is launched.
+fn open_bundle(path: &Path) -> Result<(), String> {
+    let bundle =
+        Bundle::read(path).ok_or_else(|| format!("{} is not an application", path.display()))?;
+    if bundle.entry.kind == Kind::Flatpak {
+        let installed = flatpak::is_installed(&bundle.entry.id, bundle.entry.scope);
+        let inside = Folder::of(&bundle.path).is_some();
+        if bundle::portable_install(
+            inside,
+            installed,
+            bundle::has_flatpak_ref(&bundle.path),
+            !bundle.entry.origin.is_empty(),
+        ) {
+            let folder = match bundle.entry.scope {
+                Scope::System => Folder::Shared,
+                Scope::User => Folder::Home,
+            };
+            if bundle::find(&folder.dir(), bundle.entry.kind, &bundle.entry.id).is_none() {
+                bundle::copy_into(&bundle.path, folder)?;
+            }
+            return Ok(());
+        }
+        if !installed {
+            return Err(format!("{} is not installed", bundle.entry.name));
+        }
+        return std::process::Command::new("flatpak")
+            .args(["run", &bundle.entry.id])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    if bundle.entry.kind == Kind::Appimage {
+        let run = bundle.path.join("run");
+        if run.is_file() {
+            return std::process::Command::new(run)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
+    }
+    let info = gio_unix::DesktopAppInfo::from_filename(bundle.path.join(bundle::LAUNCH))
+        .ok_or_else(|| format!("{} has no launcher", bundle.entry.name))?;
+    info.launch(&[], Some(&gio::AppLaunchContext::new()))
+        .map_err(|e| e.to_string())
 }
 
 /// Asks the running user service to show something.

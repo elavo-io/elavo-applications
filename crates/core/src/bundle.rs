@@ -15,6 +15,9 @@ pub const LAUNCH: &str = "launch.desktop";
 /// An AppImage's own desktop file, kept so a refresh can rebuild `launch.desktop`.
 pub const ORIGINAL: &str = "original.desktop";
 pub const RUN: &str = "run";
+/// The Flatpak reference kept inside a Flatpak bundle, so a copy can be
+/// installed on a computer that has never had this app.
+pub const FLATPAK_REF: &str = "app.flatpakref";
 
 #[derive(Clone, Debug)]
 pub struct Bundle {
@@ -280,8 +283,107 @@ pub fn launch_desktop(path: &Path, entry: &Entry) -> KeyFile {
     file
 }
 
+/// True when the bundle already carries a non-empty Flatpak reference.
+pub fn has_flatpak_ref(dir: &Path) -> bool {
+    std::fs::metadata(dir.join(FLATPAK_REF)).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// A Flatpak bundle copied out of the Applications folders is installed again
+/// when the app is gone and the copy can still name it.
+pub fn portable_install(inside: bool, installed: bool, has_ref: bool, has_origin: bool) -> bool {
+    !inside && !installed && (has_ref || has_origin)
+}
+
+/// Copies `src` into `folder` under the entry's name. `src` stays where it is.
+/// The service installs the copy from the folder.
+pub fn copy_into(src: &Path, folder: crate::paths::Folder) -> crate::Result<PathBuf> {
+    let bundle = Bundle::read(src).ok_or_else(|| format!("{} is not an entry", src.display()))?;
+    let dest = free_path(&folder.dir(), &bundle.entry.name);
+    copy_tree(src, &dest)?;
+    Ok(dest)
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> crate::Result<()> {
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `bytes` as [`FLATPAK_REF`]. An existing file is kept unless
+/// `replace` is set, which is how a dropped reference replaces a generated one.
+pub fn store_flatpak_ref(dir: &Path, bytes: &[u8], replace: bool) -> crate::Result<()> {
+    let path = dir.join(FLATPAK_REF);
+    if has_flatpak_ref(dir) && !replace {
+        return Ok(());
+    }
+    if bytes.is_empty() || flatpak::ref_name_in(bytes).is_none() {
+        return Ok(());
+    }
+    write_file(&path, bytes, 0o644)
+}
+
+/// Copies a dropped `.flatpakref` into the bundle, over a generated one.
+pub fn keep_dropped_ref(dir: &Path, source: &Path) -> crate::Result<()> {
+    let bytes = std::fs::read(source).map_err(|e| format!("{}: {e}", source.display()))?;
+    if flatpak::ref_name_in(&bytes).is_none() {
+        return Err(format!("{} is not a Flatpak reference", source.display()));
+    }
+    store_flatpak_ref(dir, &bytes, true)
+}
+
+/// Writes `app.flatpakref` when this Flatpak bundle does not have one.
+/// Shared entries in `/Applications` are included: the account can write
+/// them, and they are the entries people copy.
+pub fn ensure_portable_ref(bundle: &Bundle) -> crate::Result<()> {
+    if bundle.entry.kind != Kind::Flatpak {
+        return Ok(());
+    }
+    ensure_flatpak_ref(
+        &bundle.path,
+        &bundle.entry.id,
+        &bundle.entry.name,
+        &bundle.entry.origin,
+        bundle.entry.scope,
+    )
+}
+
+/// Writes a reference from the installation that already has this app.
+/// Does nothing when the bundle has one, or when the app is not deployed.
+fn ensure_flatpak_ref(
+    dir: &Path,
+    id: &str,
+    name: &str,
+    origin: &str,
+    scope: Scope,
+) -> crate::Result<()> {
+    if has_flatpak_ref(dir) {
+        return Ok(());
+    }
+    let app = flatpak::Installed {
+        id: id.to_owned(),
+        origin: origin.to_owned(),
+        name: name.to_owned(),
+    };
+    if let Some(text) = flatpak::portable_ref(&app, scope) {
+        store_flatpak_ref(dir, text.as_bytes(), false)?;
+    }
+    Ok(())
+}
+
 /// Rewrites `launch.desktop` and, for an AppImage, its `run` script.
+/// A Flatpak bundle also gains `app.flatpakref` when it does not have one yet.
 pub fn refresh(bundle: &Bundle) -> crate::Result<()> {
+    if bundle.entry.kind == Kind::Flatpak {
+        ensure_portable_ref(bundle)?;
+    }
     if bundle.entry.kind == Kind::Appimage {
         write_file(
             &bundle.path.join(RUN),
@@ -618,5 +720,72 @@ mod tests {
             with_gtk_version("gtk-launch com.google.Chrome"),
             "gtk-launch com.google.Chrome"
         );
+    }
+
+    #[test]
+    fn a_copy_outside_is_installed_only_when_the_app_is_gone() {
+        assert!(portable_install(false, false, true, false));
+        assert!(portable_install(false, false, false, true));
+        assert!(!portable_install(true, false, true, true));
+        assert!(!portable_install(false, true, true, true));
+        assert!(!portable_install(false, false, false, false));
+    }
+
+    #[test]
+    fn copying_a_bundle_keeps_the_original() {
+        let root = std::env::temp_dir().join(format!("eapp-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("FocusWriter.eapp");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("entry.json"), b"{}").unwrap();
+        std::fs::write(src.join("standard-icon.png"), b"png").unwrap();
+        let dest = root.join("Applications");
+        std::fs::create_dir(&dest).unwrap();
+        copy_tree(&src, &dest.join("FocusWriter.eapp")).unwrap();
+        assert_eq!(
+            std::fs::read(src.join("standard-icon.png")).unwrap(),
+            b"png"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("FocusWriter.eapp/standard-icon.png")).unwrap(),
+            b"png"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dropped_ref_replaces_a_generated_one() {
+        let dir = std::env::temp_dir().join(format!("eapp-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let generated =
+            b"[Flatpak Ref]\nName=org.mozilla.firefox\nUrl=https://dl.flathub.org/repo/\n";
+        store_flatpak_ref(&dir, generated, false).unwrap();
+        store_flatpak_ref(&dir, b"[Flatpak Ref]\nName=org.other.App\n", false).unwrap();
+        let kept = std::fs::read(dir.join(FLATPAK_REF)).unwrap();
+        assert_eq!(
+            flatpak::ref_name_in(&kept).as_deref(),
+            Some("org.mozilla.firefox")
+        );
+
+        let dropped = dir.join("dropped.flatpakref");
+        std::fs::write(
+            &dropped,
+            "[Flatpak Ref]\nName=org.mozilla.firefox\nUrl=https://example.com/repo/\nRuntimeRepo=https://example.com/repo/example.flatpakrepo\nGPGKey=aGk=\n",
+        )
+        .unwrap();
+        keep_dropped_ref(&dir, &dropped).unwrap();
+        let kept = std::fs::read_to_string(dir.join(FLATPAK_REF)).unwrap();
+        assert!(kept.contains("RuntimeRepo=https://example.com/repo/example.flatpakrepo\n"));
+        assert!(kept.contains("GPGKey=aGk=\n"));
+        assert!(store_flatpak_ref(&dir, b"not a ref", true).is_ok());
+        assert!(kept_still_a_ref(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn kept_still_a_ref(dir: &Path) -> bool {
+        flatpak::ref_name_in(&std::fs::read(dir.join(FLATPAK_REF)).unwrap()).as_deref()
+            == Some("org.mozilla.firefox")
     }
 }

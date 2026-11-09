@@ -75,13 +75,61 @@ pub struct Mirror {
     pub removed: Vec<PathBuf>,
 }
 
+/// What to do with a Flatpak entry whose app is not installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Absent {
+    /// A copy this machine has never installed, or an install still in progress.
+    Keep,
+    /// The app used to be installed here and is gone.
+    Remove,
+}
+
+/// `seen_here` means this machine has installed that id before. A reference
+/// for an id that was never seen is a bundle copied from somewhere else, and
+/// it stays until the service installs it. Busy and freshly arrived entries
+/// stay too: one is being installed, and one just came back from the Trash.
+pub fn absent_flatpak(has_ref: bool, seen_here: bool, busy: bool, freshly_arrived: bool) -> Absent {
+    if busy || freshly_arrived || (has_ref && !seen_here) {
+        Absent::Keep
+    } else {
+        Absent::Remove
+    }
+}
+
+/// Ids in a seen-file, one per line. None when the file has not been written.
+pub fn read_ids(path: &Path) -> Option<HashSet<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+pub fn write_ids(path: &Path, ids: &[&str]) -> crate::Result<()> {
+    let mut lines: Vec<&str> = ids.iter().copied().filter(|l| !l.is_empty()).collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    bundle::write_file(path, text.as_bytes(), 0o644)
+}
+
 /// Every Flatpak installed in the folder's scope gets an entry, unless its
 /// entry is in a Trash waiting for a decision. An entry whose Flatpak is no
-/// longer installed is removed, unless it just appeared (it came back from
-/// the Trash and is being reinstalled) or `busy` names it.
+/// longer installed is removed, unless [`absent_flatpak`] says to keep it.
+/// `seen` is the ids this machine has installed before.
 pub fn mirror(
     folder: Folder,
     in_trash: impl Fn(&str) -> bool,
+    seen: impl Fn(&str) -> bool,
     busy: &HashSet<String>,
 ) -> crate::Result<Mirror> {
     let scope = folder.scope();
@@ -94,10 +142,16 @@ pub fn mirror(
         if b.entry.kind != Kind::Flatpak || b.entry.scope != scope {
             continue;
         }
-        if ids.contains(b.entry.id.as_str()) || busy.contains(&b.entry.id) {
+        if ids.contains(b.entry.id.as_str()) {
             continue;
         }
-        if changed_within(&b.path, 120) {
+        if absent_flatpak(
+            bundle::has_flatpak_ref(&b.path),
+            seen(&b.entry.id),
+            busy.contains(&b.entry.id),
+            changed_within(&b.path, 120),
+        ) == Absent::Keep
+        {
             continue;
         }
         if std::fs::remove_dir_all(&b.path).is_ok() {
@@ -153,5 +207,34 @@ mod tests {
         assert_eq!(classify(&dir.join("Krita.eapp")), Drop::Ignore);
         assert!(changed_within(&dir.join("Folder"), 60));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copied_ref_stays_and_a_removed_install_does_not() {
+        assert_eq!(
+            absent_flatpak(true, false, false, false),
+            Absent::Keep,
+            "a reference for an app this machine has never had"
+        );
+        assert_eq!(
+            absent_flatpak(true, true, false, false),
+            Absent::Remove,
+            "the app was installed here and then removed"
+        );
+        assert_eq!(absent_flatpak(false, false, false, false), Absent::Remove);
+        assert_eq!(absent_flatpak(true, true, true, false), Absent::Keep);
+        assert_eq!(absent_flatpak(false, true, false, true), Absent::Keep);
+
+        let path = std::env::temp_dir().join(format!("seen-ids-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(read_ids(&path).is_none());
+        write_ids(&path, &["org.b.App", "org.a.App", "org.a.App"]).unwrap();
+        let ids = read_ids(&path).unwrap();
+        assert!(ids.contains("org.a.App"));
+        assert!(ids.contains("org.b.App"));
+        assert_eq!(ids.len(), 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "org.a.App\norg.b.App\n");
+        let _ = std::fs::remove_file(&path);
     }
 }

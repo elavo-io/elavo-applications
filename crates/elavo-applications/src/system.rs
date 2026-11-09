@@ -56,6 +56,7 @@ pub fn run() -> ExitCode {
     let mirror = reconcile::mirror(
         folder,
         |id| trash::holds_app(&dir, id, true) || seen.as_ref().is_some_and(|s| s.contains(id)),
+        |id| seen.as_ref().is_some_and(|s| s.contains(id)),
         &HashSet::new(),
     );
     match mirror {
@@ -119,25 +120,12 @@ fn seen_path() -> std::path::PathBuf {
 /// The system Flatpaks the last pass saw. None before the first pass, so
 /// that pass makes an entry for every installed Flatpak.
 fn seen_flatpaks() -> Option<HashSet<String>> {
-    let text = std::fs::read_to_string(seen_path()).ok()?;
-    Some(
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
+    reconcile::read_ids(&seen_path())
 }
 
 /// An uninstalled Flatpak drops out, so installing it again makes an entry.
 fn save_seen_flatpaks(ids: &[&str]) -> Result<(), String> {
-    let mut text = ids.join("\n");
-    text.push('\n');
-    let path = seen_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    bundle::write_file(&path, text.as_bytes(), 0o644)
+    reconcile::write_ids(&seen_path(), ids)
 }
 
 /// Root made this bundle; administrators must still be able to delete it.

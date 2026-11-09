@@ -6,7 +6,7 @@
 //! is deleted.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use crate::prompt::{Answer, Choice, Layout, Prompt, Style};
 const APP_ID: &str = "io.elavo.Applications";
 /// Files the service writes inside a bundle. Anything else that appears
 /// there is a picture dropped onto the entry.
-const OWN_FILES: [&str; 7] = [
+const OWN_FILES: [&str; 8] = [
     "entry.json",
     "launch.desktop",
     "original.desktop",
@@ -33,6 +33,7 @@ const OWN_FILES: [&str; 7] = [
     "icon.png",
     "icon.svg",
     icon::STANDARD,
+    bundle::FLATPAK_REF,
 ];
 
 /// `files` are AppImages and Flatpak files someone opened. Files hands them
@@ -80,6 +81,37 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+fn installed_ids(scope: Scope) -> Option<HashSet<String>> {
+    flatpak::list(scope).map(|apps| apps.into_iter().map(|a| a.id).collect())
+}
+
+/// Copies a dropped `.flatpakref` into an entry. True when there was
+/// nothing to copy or the copy landed, so the drop may be deleted.
+async fn keep_ref(dir: &Path, source: Option<&Path>) -> bool {
+    let Some(source) = source.map(Path::to_path_buf) else {
+        return true;
+    };
+    let dir = dir.to_path_buf();
+    blocking(move || bundle::keep_dropped_ref(&dir, &source))
+        .await
+        .is_ok()
+}
+
+/// A Flatpak entry whose app is not installed and should be installed now:
+/// a reference this machine has never seen, or an entry that just came back.
+fn arrives_uninstalled(
+    bundle: &Bundle,
+    installed: &HashSet<String>,
+    seen: &HashSet<String>,
+) -> bool {
+    if bundle.entry.kind != Kind::Flatpak || installed.contains(&bundle.entry.id) {
+        return false;
+    }
+    let portable = bundle::has_flatpak_ref(&bundle.path) && !seen.contains(&bundle.entry.id);
+    let restored = !bundle.entry.origin.is_empty() && reconcile::changed_within(&bundle.path, 120);
+    portable || restored
+}
+
 fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -118,6 +150,9 @@ struct Service {
     queued: RefCell<HashSet<PathBuf>>,
     timer: Cell<bool>,
     mirror_queued: Cell<bool>,
+    /// Flatpak entries to install from their own reference, one at a time.
+    installs: RefCell<VecDeque<Bundle>>,
+    installing: Cell<bool>,
 }
 
 impl Service {
@@ -138,6 +173,8 @@ impl Service {
             queued: RefCell::default(),
             timer: Cell::new(false),
             mirror_queued: Cell::new(false),
+            installs: RefCell::default(),
+            installing: Cell::new(false),
         });
         let missing = gio::SimpleAction::new("missing", Some(glib::VariantTy::STRING));
         let weak = Rc::downgrade(&service);
@@ -199,11 +236,40 @@ impl Service {
     fn start(self: &Rc<Self>) {
         let _ = std::fs::create_dir_all(Folder::Home.dir());
         seed_bookmarks();
+        let user_installed = installed_ids(Scope::User);
+        let system_installed = installed_ids(Scope::System);
+        let seen_user = reconcile::read_ids(&paths::user_seen_flatpaks()).unwrap_or_default();
+        let seen_system =
+            reconcile::read_ids(&paths::system_state().join("seen-flatpaks")).unwrap_or_default();
         for folder in Self::folders() {
             self.watch_folder(folder);
             for b in bundle::list(&folder.dir()) {
-                if reconcile::owner(&b.path) == Some(uid()) {
+                let mine = reconcile::owner(&b.path) == Some(uid());
+                // `/Applications` is the main folder. Its entries are owned
+                // by root, and this account can still write them.
+                if paths::writable(&b.path) {
+                    let _ = bundle::ensure_portable_ref(&b);
+                }
+                if mine {
                     let _ = bundle::refresh(&b);
+                }
+                let installed = match b.entry.scope {
+                    Scope::User => &user_installed,
+                    Scope::System => &system_installed,
+                };
+                let seen = match b.entry.scope {
+                    Scope::User => &seen_user,
+                    Scope::System => &seen_system,
+                };
+                if mine
+                    && installed
+                        .as_ref()
+                        .is_some_and(|ids| arrives_uninstalled(&b, ids, seen))
+                {
+                    self.appeared(folder, b.path.clone());
+                    continue;
+                }
+                if mine {
                     self.watch_bundle(&b.path);
                 }
                 set_file_icon(&b);
@@ -578,15 +644,22 @@ impl Service {
             }
         }
         self.busy.borrow_mut().remove(&id);
-        if consumed {
-            let _ = std::fs::remove_file(&path);
-        }
+        let dropped_ref = match &source {
+            flatpak::Source::Ref(p) => Some(p.clone()),
+            flatpak::Source::Bundle(_) => None,
+        };
         let dir = folder.dir();
         // The root service makes shared entries when the system Flatpaks
         // change. Making one here too would race it into a duplicate.
+        // The dropped reference is copied in before it is deleted, so the
+        // publisher's RuntimeRepo and GPG key replace a generated one.
         if folder == Folder::Shared {
             for _ in 0..20 {
                 if let Some(b) = bundle::find(&dir, Kind::Flatpak, &id) {
+                    let kept = keep_ref(&b.path, dropped_ref.as_deref()).await;
+                    if consumed && kept {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     self.after_install(folder, &b);
                     self.ready(&b).await;
                     return;
@@ -594,24 +667,37 @@ impl Service {
                 sleep(500).await;
             }
         }
-        let made = blocking(move || {
-            if let Some(b) = bundle::find(&dir, Kind::Flatpak, &id) {
-                return Ok(b);
+        let made = blocking({
+            let id = id.clone();
+            let dropped_ref = dropped_ref.clone();
+            move || -> Result<(Bundle, bool), String> {
+                let bundle = if let Some(b) = bundle::find(&dir, Kind::Flatpak, &id) {
+                    b
+                } else {
+                    let app = flatpak::list(scope)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|a| a.id == id)
+                        .unwrap_or(flatpak::Installed {
+                            id: id.clone(),
+                            origin: String::new(),
+                            name: id.clone(),
+                        });
+                    bundle::create_flatpak(&dir, &app, scope)?
+                };
+                let kept = match &dropped_ref {
+                    Some(ref_file) => bundle::keep_dropped_ref(&bundle.path, ref_file).is_ok(),
+                    None => true,
+                };
+                Ok((bundle, kept))
             }
-            let app = flatpak::list(scope)
-                .unwrap_or_default()
-                .into_iter()
-                .find(|a| a.id == id)
-                .unwrap_or(flatpak::Installed {
-                    id: id.clone(),
-                    origin: String::new(),
-                    name: id.clone(),
-                });
-            bundle::create_flatpak(&dir, &app, scope)
         })
         .await;
+        if consumed && made.as_ref().is_ok_and(|(_, kept)| *kept) {
+            let _ = std::fs::remove_file(&path);
+        }
         match made {
-            Ok(b) => {
+            Ok((b, _)) => {
                 self.after_install(folder, &b);
                 self.ready(&b).await;
             }
@@ -858,40 +944,93 @@ impl Service {
                 let _ = bundle::refresh(&b);
                 let _ = bundle::sync_exports(folder);
             }
-            Kind::Flatpak if mine && !b.entry.origin.is_empty() => {
-                let this = self.clone();
-                glib::spawn_future_local(async move { this.reinstall(b).await });
+            Kind::Flatpak
+                if mine && (bundle::has_flatpak_ref(&b.path) || !b.entry.origin.is_empty()) =>
+            {
+                self.queue_install(b);
             }
             _ => {}
         }
     }
 
-    /// A Flatpak entry came back from the Trash after it was uninstalled.
+    /// One Flatpak entry at a time, so a copied folder reuses one window.
+    fn queue_install(self: &Rc<Self>, bundle: Bundle) {
+        self.installs.borrow_mut().push_back(bundle);
+        self.pump_installs();
+    }
+
+    fn pump_installs(self: &Rc<Self>) {
+        if self.installing.get() {
+            return;
+        }
+        let Some(bundle) = self.installs.borrow_mut().pop_front() else {
+            return;
+        };
+        self.installing.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.reinstall(bundle).await;
+            this.installing.set(false);
+            this.pump_installs();
+        });
+    }
+
+    /// A Flatpak entry arrived and its app is not installed: a copy from
+    /// another computer, or a restore from the Trash. A bundled reference
+    /// installs with progress. Without one, the origin remote is used, which
+    /// only works when that remote is already configured here.
     async fn reinstall(self: &Rc<Self>, b: Bundle) {
+        if !b.path.is_dir() {
+            return;
+        }
         let (id, scope, origin) = (b.entry.id.clone(), b.entry.scope, b.entry.origin.clone());
         let check = id.clone();
         if blocking(move || flatpak::is_installed(&check, scope)).await {
             let _ = bundle::refresh(&b);
+            set_file_icon(&b);
             return;
         }
         if !self.busy.borrow_mut().insert(id.clone()) {
             return;
         }
-        self.prompt.tell(
-            &format!("Reinstalling {}…", b.entry.name),
-            "It was put back from the Trash. It can be opened again once it has downloaded.",
-        );
-        let install_id = id.clone();
-        let result = blocking(move || flatpak::install_from(&origin, &install_id, scope)).await;
+        let ref_path = b.path.join(bundle::FLATPAK_REF);
+        let from_ref = ref_path.is_file();
+        let result = if from_ref {
+            let p = ref_path.clone();
+            let host = blocking(move || flatpak::ref_host(&p)).await;
+            let source = flatpak::Source::Ref(ref_path);
+            if self
+                .run_install(&b.entry.name, host.as_deref(), &source, scope)
+                .await
+            {
+                Ok(())
+            } else {
+                Err(None)
+            }
+        } else if !origin.is_empty() {
+            self.prompt.tell(
+                &format!("Reinstalling {}…", b.entry.name),
+                "It was put back from the Trash. It can be opened again once it has downloaded.",
+            );
+            let install_id = id.clone();
+            blocking(move || flatpak::install_from(&origin, &install_id, scope))
+                .await
+                .map_err(Some)
+        } else {
+            Err(Some(
+                "This entry has no reference to install from.".to_owned(),
+            ))
+        };
         self.busy.borrow_mut().remove(&id);
         match result {
             Ok(()) => {
                 let _ = bundle::refresh(&b);
                 set_file_icon(&b);
             }
-            Err(e) => self
+            Err(Some(e)) => self
                 .prompt
                 .tell(&format!("{} could not be reinstalled", b.entry.name), &e),
+            Err(None) => {}
         }
     }
 
@@ -1241,8 +1380,20 @@ impl Service {
         let busy = self.busy.borrow().clone();
         glib::spawn_future_local(async move {
             let dir = Folder::Home.dir();
+            let seen_path = paths::user_seen_flatpaks();
             let result = blocking(move || {
-                reconcile::mirror(Folder::Home, |id| trash::holds_app(&dir, id, false), &busy)
+                let seen = reconcile::read_ids(&seen_path).unwrap_or_default();
+                let changes = reconcile::mirror(
+                    Folder::Home,
+                    |id| trash::holds_app(&dir, id, false),
+                    |id| seen.contains(id),
+                    &busy,
+                )?;
+                if let Some(installed) = flatpak::list(Scope::User) {
+                    let ids: Vec<&str> = installed.iter().map(|a| a.id.as_str()).collect();
+                    let _ = reconcile::write_ids(&seen_path, &ids);
+                }
+                Ok::<_, String>(changes)
             })
             .await;
             let Ok(changes) = result else { return };

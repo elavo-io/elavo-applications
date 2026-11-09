@@ -4,19 +4,28 @@
  *   showing the directory. Nautilus 50 opens folders through internal calls,
  *   so the module watches each window slot's location: when it goes from a
  *   folder into an .eapp entry in that folder, it starts the entry and goes
- *   back. Opening an entry in a new tab or window shows its contents.
+ *   back. A copy that lives outside the Applications folders is opened with
+ *   elavo-applications-ctl open: a Flatpak whose app is gone is copied back
+ *   in and installed, and the original copy stays. Opening an entry in a
+ *   new tab or window shows its contents.
+ * - A copied bundle keeps the icon file inside it. Files' stored icon is a
+ *   path, and that path dies when the original entry is uninstalled, so the
+ *   module points the copy at its own icon.
  * - Move to Trash and Delete refuse an entry whose application is running.
  *   The view's actions are replaced by wrappers that check first and then
  *   call Nautilus's own action. Emission hooks cannot stop a signal.
  * - /Applications is on /var, which GIO will not trash. Move to Trash and
  *   Delete there ask the service (elavo-applications-ctl remove) and leave
  *   the entry in place until Uninstall. The home folder still uses Trash.
- * - A drag that starts on an entry never moves or copies the install.
- *   Wayland has no link action, so the drag offers a copy. Dropped in a
- *   Files window, on a folder, a sidebar place, or the path bar, the entry
- *   is swapped for a shortcut file and Nautilus copies that; inside an
- *   Applications folder the drop does nothing. The Dock pins it and the
- *   desktop makes its own shortcut.
+ * - A drag that starts on an entry in an Applications folder never moves or
+ *   copies the install. Wayland has no link action, so the drag offers a
+ *   copy. Dropped in a Files window, on a folder, a sidebar place, or the
+ *   path bar, the entry is swapped for a shortcut file and Nautilus copies
+ *   that; inside an Applications folder the drop does nothing. A bundle that
+ *   is already a copy outside those folders is the bundle: dropping it into
+ *   Applications copies the directory, and dropping it anywhere else copies
+ *   the directory too. The Dock pins an install and the desktop makes its
+ *   own shortcut.
  * - Item labels leave out the .eapp suffix.
  * - A drop into a shared folder this account cannot write asks for an
  *   administrator's password (elavo-applications-ctl install --shared).
@@ -27,6 +36,7 @@
  */
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <gio/gdesktopappinfo.h>
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
@@ -329,23 +339,51 @@ typedef struct {
     char *bundle;
 } Opened;
 
+static gboolean in_applications(const char *resolved);
+
+static void
+tell_open_failed(GtkWidget *slot, const char *bundle, const char *detail)
+{
+    char *name = entry_name(bundle);
+    char *heading = g_strdup_printf("“%s” could not be opened", name);
+
+    tell(slot, heading, detail && *detail ? detail : "The application could not be opened");
+    g_free(heading);
+    g_free(name);
+}
+
 static gboolean
 launch_and_return(gpointer data)
 {
     Opened *opened = data;
     char *desktop = g_build_filename(opened->bundle, "launch.desktop", NULL);
-    GDesktopAppInfo *info = g_desktop_app_info_new_from_filename(desktop);
+    GDesktopAppInfo *info = NULL;
     GError *error = NULL;
 
     gtk_widget_activate_action(opened->slot, "slot.back", NULL);
+    /* A copy outside Applications is not the install. Opening it puts a
+     * missing Flatpak back, or launches the copy. flatpak run of an
+     * uninstalled app exits immediately and still counts as launched. */
+    if (!in_applications(opened->bundle)) {
+        const char *argv[] = { ctl(), "open", opened->bundle, NULL };
+        char *err = NULL;
+        int status = 0;
+
+        if (!g_spawn_sync(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err, &status, NULL) ||
+            !g_spawn_check_wait_status(status, NULL))
+            tell_open_failed(opened->slot, opened->bundle, err);
+        g_free(err);
+        g_free(desktop);
+        g_object_unref(opened->slot);
+        g_free(opened->bundle);
+        g_free(opened);
+        return G_SOURCE_REMOVE;
+    }
+    info = g_desktop_app_info_new_from_filename(desktop);
     if (info) {
         GdkAppLaunchContext *context = gdk_display_get_app_launch_context(gtk_widget_get_display(opened->slot));
         if (!g_app_info_launch(G_APP_INFO(info), NULL, G_APP_LAUNCH_CONTEXT(context), &error)) {
-            char *name = entry_name(opened->bundle);
-            char *heading = g_strdup_printf("“%s” could not be opened", name);
-            tell(opened->slot, heading, error->message);
-            g_free(heading);
-            g_free(name);
+            tell_open_failed(opened->slot, opened->bundle, error->message);
             g_clear_error(&error);
         }
         g_object_unref(context);
@@ -665,18 +703,62 @@ installable(const char *path)
            g_str_has_suffix(path, ".flatpakref") || g_str_has_suffix(path, ".flatpak");
 }
 
-/* The folder a drop lands in, where that is known: the folder item it was
- * dropped on, or the folder the view shows. NULL for the sidebar and the
- * path bar. */
 static char *
-drop_folder(GtkWidget *widget)
+path_from_uri(const char *uri)
 {
+    GFile *file;
+    char *path;
+
+    if (!uri)
+        return NULL;
+    file = g_file_new_for_uri(uri);
+    path = g_file_get_path(file);
+    g_object_unref(file);
+    return path;
+}
+
+/* A sidebar row keeps its folder in the "uri" property. */
+static char *
+row_folder(GtkWidget *row)
+{
+    char *uri = NULL;
+    char *path;
+
+    if (!row || !g_object_class_find_property(G_OBJECT_GET_CLASS(row), "uri"))
+        return NULL;
+    g_object_get(row, "uri", &uri, NULL);
+    path = path_from_uri(uri);
+    g_free(uri);
+    return path;
+}
+
+/* The folder a drop lands in. The sidebar's drop target is the list, so the
+ * place is the row under the pointer, not an ancestor. The path bar keeps
+ * its path private. A sidebar drop is never the folder the window is showing. */
+static char *
+drop_folder(GtkWidget *widget, double y)
+{
+    GType row_type = g_type_from_name("NautilusSidebarRow");
+    GtkWidget *row;
+    char *path;
+
     if (view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) {
-        char *path = cell_path(widget);
+        path = cell_path(widget);
         if (path && g_file_test(path, G_FILE_TEST_IS_DIR))
             return path;
         g_free(path);
     }
+    row = ancestor(widget, row_type);
+    if (!row && GTK_IS_LIST_BOX(widget))
+        row = GTK_WIDGET(gtk_list_box_get_row_at_y(GTK_LIST_BOX(widget), y));
+    if (row && (!row_type || g_type_check_instance_is_a((GTypeInstance *)row, row_type))) {
+        path = row_folder(row);
+        if (path)
+            return path;
+    }
+    if (ancestor(widget, sidebar_type) ||
+        (sidebar_type && g_type_check_instance_is_a((GTypeInstance *)widget, sidebar_type)))
+        return NULL;
     return slot_path(ancestor(widget, slot_type));
 }
 
@@ -754,10 +836,10 @@ shortcut_for(const char *bundle)
 /* Decides a drop before Nautilus does. TRUE ends it. Otherwise, when
  * `replacement` was filled in, Nautilus gets that file list instead. */
 static gboolean
-on_drop(GtkDropTarget *target, const GValue *value, GValue *replacement)
+on_drop(GtkDropTarget *target, const GValue *value, double y, GValue *replacement)
 {
     GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(target));
-    char *folder = drop_folder(widget);
+    char *folder = drop_folder(widget, y);
     char *resolved = real(folder);
     char *shared = shared_dir();
     gboolean handled = FALSE;
@@ -768,20 +850,24 @@ on_drop(GtkDropTarget *target, const GValue *value, GValue *replacement)
         goto out;
     files = gdk_file_list_get_files(g_value_get_boxed(value));
 
-    /* An entry dragged out of Applications becomes a shortcut wherever it
-     * lands, and nothing at all inside an Applications folder. The drag
-     * offers a copy, the one action Wayland has that suits, so Nautilus is
-     * handed the shortcut to copy instead of the install. */
+    /* An install dragged out of Applications becomes a shortcut. A drop of
+     * that install back into Applications does nothing. A bundle that is
+     * already a copy is left as the directory, so a drop into Applications
+     * copies it and the service installs it. */
     for (l = files; l; l = l->next) {
         char *path = g_file_get_path(l->data);
         char *bundle = real(path);
         if (bundle && is_bundle(bundle)) {
-            GFile *shortcut = NULL;
+            gboolean source_apps = in_applications(bundle);
+            gboolean dest_apps = resolved && in_applications(resolved);
             bundles = TRUE;
-            if (!(resolved && in_applications(resolved)))
-                shortcut = shortcut_for(bundle);
-            if (shortcut)
-                swapped = g_slist_prepend(swapped, shortcut);
+            if (source_apps && !dest_apps) {
+                GFile *shortcut = shortcut_for(bundle);
+                if (shortcut)
+                    swapped = g_slist_prepend(swapped, shortcut);
+            } else if (!source_apps) {
+                swapped = g_slist_prepend(swapped, g_object_ref(l->data));
+            }
         } else {
             swapped = g_slist_prepend(swapped, g_object_ref(l->data));
         }
@@ -837,7 +923,7 @@ on_drop_first(GtkDropTarget *target, const GValue *value, double x, double y, gp
     (void)data;
     if (g_object_get_data(G_OBJECT(target), PASSING))
         return FALSE;
-    if (on_drop(target, value, &replacement))
+    if (on_drop(target, value, y, &replacement))
         return TRUE;
     if (blocked && blocked->len > 0) {
         for (i = 0; i < blocked->len; i++)
@@ -927,6 +1013,85 @@ on_drag_end_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpo
     return TRUE;
 }
 
+/* ---- Icons on copies ---- */
+
+/* The picture that travels inside the bundle, in the order the service uses. */
+static const char *BUNDLE_ICONS[] = {
+    "custom-icon.png", "custom-icon.svg", "custom-icon.webp",
+    "standard-icon.png", "icon.svg", "icon.png", NULL
+};
+
+static char *
+bundle_icon(const char *bundle)
+{
+    guint i;
+
+    for (i = 0; BUNDLE_ICONS[i]; i++) {
+        char *path = g_build_filename(bundle, BUNDLE_ICONS[i], NULL);
+        if (g_file_test(path, G_FILE_TEST_IS_REGULAR))
+            return path;
+        g_free(path);
+    }
+    return NULL;
+}
+
+static gboolean
+icon_inside(const char *uri, const char *bundle)
+{
+    GFile *file;
+    char *path;
+    gsize n;
+    gboolean ok = FALSE;
+
+    if (!uri)
+        return FALSE;
+    file = g_file_new_for_uri(uri);
+    path = g_file_get_path(file);
+    n = strlen(bundle);
+    if (path && strncmp(path, bundle, n) == 0 && path[n] == '/' && g_file_test(path, G_FILE_TEST_IS_REGULAR))
+        ok = TRUE;
+    g_free(path);
+    g_object_unref(file);
+    return ok;
+}
+
+/* Files stores a folder icon as a path. A copy does not get the original's
+ * metadata, and the original path is gone once that entry is uninstalled. */
+static void
+ensure_bundle_icon(const char *bundle)
+{
+    char *icon = bundle_icon(bundle);
+    GFile *dir;
+    GFileInfo *info;
+    char *current = NULL;
+
+    if (!icon)
+        return;
+    dir = g_file_new_for_path(bundle);
+    info = g_file_query_info(dir, "metadata::custom-icon", G_FILE_QUERY_INFO_NONE, NULL, NULL);
+    if (info)
+        current = g_strdup(g_file_info_get_attribute_string(info, "metadata::custom-icon"));
+    if (!icon_inside(current, bundle)) {
+        GFile *icon_file = g_file_new_for_path(icon);
+        char *uri = g_file_get_uri(icon_file);
+        struct timespec times[2] = {
+            { .tv_nsec = UTIME_OMIT },
+            { .tv_nsec = UTIME_NOW },
+        };
+
+        g_file_set_attribute_string(dir, "metadata::custom-icon", uri, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+        g_file_set_attribute(dir, "metadata::custom-icon-name", G_FILE_ATTRIBUTE_TYPE_INVALID, NULL,
+                             G_FILE_QUERY_INFO_NONE, NULL, NULL);
+        utimensat(AT_FDCWD, bundle, times, 0);
+        g_free(uri);
+        g_object_unref(icon_file);
+    }
+    g_free(current);
+    g_clear_object(&info);
+    g_object_unref(dir);
+    g_free(icon);
+}
+
 /* ---- Setup ---- */
 
 static gboolean
@@ -956,8 +1121,15 @@ on_map_hook(GSignalInvocationHint *hint, guint n, const GValue *values, gpointer
         watch_label(widget);
     else if ((GTK_IS_GRID_VIEW(widget) || GTK_IS_COLUMN_VIEW(widget)) && ancestor(widget, files_view_type))
         watch_drop_targets(widget);
-    else if ((view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) ||
-             ancestor(widget, sidebar_type) || ancestor(widget, path_bar_type))
+    else if (view_cell_type && g_type_check_instance_is_a((GTypeInstance *)widget, view_cell_type)) {
+        char *path = cell_path(widget);
+        char *resolved = real(path);
+        if (resolved && is_bundle(resolved))
+            ensure_bundle_icon(resolved);
+        g_free(resolved);
+        g_free(path);
+        watch_drop_targets(widget);
+    } else if (ancestor(widget, sidebar_type) || ancestor(widget, path_bar_type))
         watch_drop_targets(widget);
     return TRUE;
 }
